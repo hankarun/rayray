@@ -128,6 +128,8 @@ struct PhysicsSphere
 {
     BodyID bodyID;
     ::Color color;
+    float stoppedTimer; // Timer to track how long the sphere has been stopped
+    bool markedForDestruction;
 };
 
 // Perlin noise implementation
@@ -211,6 +213,40 @@ public:
         return total / maxValue;
     }
 };
+
+void ModifyHeightmap(std::vector<float>& heightSamples, int heightmapSize, float worldX, float worldZ, float radius, float heightIncrease, float terrainScale, float heightScale) {
+    // Convert world position to heightmap coordinates
+    // Terrain is centered at origin, spans -10 to +10 in world space
+    float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
+    float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
+    
+    int centerX = (int)hmX;
+    int centerZ = (int)hmZ;
+    int radiusInSamples = (int)(radius / terrainScale);
+    
+    // Modify heightmap in a circular area
+    for (int z = centerZ - radiusInSamples; z <= centerZ + radiusInSamples; z++) {
+        for (int x = centerX - radiusInSamples; x <= centerX + radiusInSamples; x++) {
+            if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
+                float dx = x - hmX;
+                float dz = z - hmZ;
+                float dist = sqrtf(dx * dx + dz * dz);
+                
+                if (dist <= radiusInSamples) {
+                    // Smooth falloff based on distance
+                    float falloff = 1.0f - (dist / radiusInSamples);
+                    falloff = falloff * falloff; // Squared for smoother transition
+                    
+                    heightSamples[z * heightmapSize + x] += heightIncrease * falloff;
+                    // Clamp height to valid range
+                    if (heightSamples[z * heightmapSize + x] > heightScale) {
+                        heightSamples[z * heightmapSize + x] = heightScale;
+                    }
+                }
+            }
+        }
+    }
+}
 
 Image GeneratePerlinNoiseHeightmap(int width, int height, float scale, int octaves, float persistence) {
     PerlinNoise perlin;
@@ -441,6 +477,12 @@ int main() {
                 EMotionType::Dynamic,
                 Layers::MOVING);
             
+            // Set high friction and damping to reduce rolling (act like lumps)
+            sphere_body_settings.mFriction = 2.5f; // Very high friction
+            sphere_body_settings.mRestitution = 0.1f; // Low bounce
+            sphere_body_settings.mLinearDamping = 0.8f; // High linear damping
+            sphere_body_settings.mAngularDamping = 0.9f; // Very high angular damping to stop rolling
+            
             Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
             BodyID sphere_id = sphere_body->GetID();
             body_interface.AddBody(sphere_id, EActivation::Activate);
@@ -453,13 +495,107 @@ int main() {
                 255
             };
             
-            dynamicSpheres.push_back({sphere_id, sphereColor});
+            dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false});
         }
 
         // Update physics (60 Hz simulation)
         const float deltaTime = GetFrameTime();
         const int collisionSteps = 1;
         physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
+        
+        // Check for stopped spheres and modify heightmap
+        const float stoppedVelocityThreshold = 0.1f; // Velocity below this is considered stopped
+        const float stoppedTimeRequired = 0.5f; // Seconds sphere must be stopped before modification
+        bool heightmapModified = false;
+        
+        for (auto& sphere : dynamicSpheres) {
+            if (sphere.markedForDestruction) continue;
+            
+            // Get sphere velocity
+            Vec3 velocity = body_interface.GetLinearVelocity(sphere.bodyID);
+            float speed = velocity.Length();
+            
+            // Check if sphere is moving slowly
+            if (speed < stoppedVelocityThreshold) {
+                sphere.stoppedTimer += deltaTime;
+                
+                // If stopped long enough, modify heightmap and mark for destruction
+                if (sphere.stoppedTimer >= stoppedTimeRequired) {
+                    RVec3 position = body_interface.GetPosition(sphere.bodyID);
+                    float worldX = (float)position.GetX();
+                    float worldY = (float)position.GetY();
+                    float worldZ = (float)position.GetZ();
+                    
+                    // Check if sphere is touching or near the ground
+                    // Sample heightmap at sphere position to see if it's close
+                    float terrainHeight = 0.0f;
+                    float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
+                    float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
+                    int ix = (int)hmX;
+                    int iz = (int)hmZ;
+                    
+                    if (ix >= 0 && ix < heightmapSize && iz >= 0 && iz < heightmapSize) {
+                        terrainHeight = heightSamples[iz * heightmapSize + ix];
+                    }
+                    
+                    // If sphere is close to terrain (within 1 unit), modify heightmap
+                    if (worldY - 0.5f <= terrainHeight + 1.0f) {
+                        // Modify heightmap
+                        ModifyHeightmap(heightSamples, heightmapSize, worldX, worldZ, 
+                                      1.5f, 0.3f, terrainScale, heightScale);
+                        heightmapModified = true;
+                        sphere.markedForDestruction = true;
+                    }
+                }
+            } else {
+                // Reset timer if sphere is still moving
+                sphere.stoppedTimer = 0.0f;
+            }
+        }
+        
+        // If heightmap was modified, recreate the physics body
+        if (heightmapModified) {
+            // Remove old heightmap body
+            body_interface.RemoveBody(heightmap_body->GetID());
+            body_interface.DestroyBody(heightmap_body->GetID());
+            
+            // Create new heightfield shape with updated heights
+            HeightFieldShapeSettings new_heightfield_settings(heightSamples.data(), Vec3(0, 0, 0), 
+                Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
+            ShapeSettings::ShapeResult new_heightfield_shape_result = new_heightfield_settings.Create();
+            ShapeRefC new_heightfield_shape = new_heightfield_shape_result.Get();
+            
+            // Create new static body for heightmap
+            BodyCreationSettings new_heightmap_body_settings(new_heightfield_shape, 
+                RVec3(-10.0, 0.0, -10.0),
+                Quat::sIdentity(), 
+                EMotionType::Static, 
+                Layers::NON_MOVING);
+            heightmap_body = body_interface.CreateBody(new_heightmap_body_settings);
+            body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
+            
+            // Update visual heightmap texture
+            ::Color* newPixels = (::Color*)RL_MALLOC(heightmapSize * heightmapSize * sizeof(::Color));
+            for (int y = 0; y < heightmapSize; y++) {
+                for (int x = 0; x < heightmapSize; x++) {
+                    unsigned char value = (unsigned char)((heightSamples[y * heightmapSize + x] / heightScale) * 255.0f);
+                    newPixels[y * heightmapSize + x] = ::Color{ value, value, value, 255 };
+                }
+            }
+            UpdateTexture(heightmapTexture, newPixels);
+            RL_FREE(newPixels);
+        }
+        
+        // Remove and destroy marked spheres
+        for (auto it = dynamicSpheres.begin(); it != dynamicSpheres.end(); ) {
+            if (it->markedForDestruction) {
+                body_interface.RemoveBody(it->bodyID);
+                body_interface.DestroyBody(it->bodyID);
+                it = dynamicSpheres.erase(it);
+            } else {
+                ++it;
+            }
+        }
 
         // Rotate light direction around a circle
         lightAngle += 0.5f * GetFrameTime();
