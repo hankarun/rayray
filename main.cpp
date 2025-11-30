@@ -643,6 +643,13 @@ int main() {
     float cubeDigDepth = 0.3f; // How deep the cube digs into terrain
     float sphereSpawnAccumulator = 0.0f; // Accumulate displaced volume for spawning spheres
     const float stoppedTimeThreshold = 0.5f; // Time in seconds before sphere converts to earth
+    
+    // GUI settings for cube (applied on reset)
+    float guiCubeStartX = -12.0f;
+    float guiCubeStartZ = 0.0f;
+    float guiCubeSpeed = 3.0f;
+    bool showGui = true;
+    int activeSlider = -1; // Track which slider is being dragged
 
     // List to hold dynamic spheres
     std::vector<PhysicsSphere> dynamicSpheres;
@@ -749,7 +756,11 @@ int main() {
         // Update moving cube position (left to right)
         cubePosition.x += cubeSpeed * deltaTime;
         if (cubePosition.x > cubeMaxX) {
-            cubePosition.x = cubeMinX; // Reset to left side
+            // Reset cube with GUI values
+            cubePosition.x = guiCubeStartX;
+            cubePosition.z = guiCubeStartZ;
+            cubeSpeed = guiCubeSpeed;
+            cubeMinX = guiCubeStartX;
         }
         
         // Sample terrain height at cube position to make it follow terrain
@@ -1009,6 +1020,117 @@ int main() {
         DrawText(TextFormat("Sphere Count: %d", (int)dynamicSpheres.size()), 10, 35, 16, ::DARKGRAY);
         DrawText(TextFormat("Sphere Radius: %.2fm", sphereRadius), 10, 55, 16, ::DARKGRAY);
         DrawFPS(10, 75);
+        
+        // Toggle GUI with G key
+        if (IsKeyPressed(KEY_G)) showGui = !showGui;
+        
+        // Draw GUI panel for cube settings
+        if (showGui) {
+            int panelX = screenWidth - 230;
+            int panelY = 10;
+            int panelW = 220;
+            int panelH = 160;
+            
+            DrawRectangle(panelX, panelY, panelW, panelH, Fade(::LIGHTGRAY, 0.9f));
+            DrawRectangleLines(panelX, panelY, panelW, panelH, ::DARKGRAY);
+            DrawText("Cube Settings (next reset)", panelX + 5, panelY + 5, 10, ::DARKGRAY);
+            
+            Vector2 mousePos = GetMousePosition();
+            bool mouseDown = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+            bool mousePressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+            bool mouseReleased = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
+            
+            // Custom slider helper lambda-like logic
+            // Slider 1: Start X
+            {
+                int sliderX = panelX + 70;
+                int sliderY = panelY + 30;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = -12.0f, maxVal = 12.0f;
+                
+                DrawText("Start X:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiCubeStartX - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 0;
+                }
+                if (activeSlider == 0 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiCubeStartX = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.1f", guiCubeStartX), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
+            
+            // Slider 2: Start Z
+            {
+                int sliderX = panelX + 70;
+                int sliderY = panelY + 55;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = -10.0f, maxVal = 10.0f;
+                
+                DrawText("Start Z:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiCubeStartZ - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 1;
+                }
+                if (activeSlider == 1 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiCubeStartZ = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.1f", guiCubeStartZ), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
+            
+            // Slider 3: Speed
+            {
+                int sliderX = panelX + 70;
+                int sliderY = panelY + 80;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = 0.5f, maxVal = 10.0f;
+                
+                DrawText("Speed:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiCubeSpeed - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 2;
+                }
+                if (activeSlider == 2 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiCubeSpeed = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.1f", guiCubeSpeed), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
+            
+            if (mouseReleased) activeSlider = -1;
+            
+            // Current position display
+            DrawText(TextFormat("Current: (%.1f, %.1f, %.1f)", cubePosition.x, cubePosition.y, cubePosition.z), 
+                     panelX + 5, panelY + 110, 10, ::BLUE);
+            
+            DrawText("Press G to toggle GUI", panelX + 5, panelY + 130, 10, ::GRAY);
+            DrawText("Settings apply on next reset", panelX + 5, panelY + 143, 10, ::GRAY);
+        }
 
         EndDrawing();
     }
