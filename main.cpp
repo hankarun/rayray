@@ -403,6 +403,7 @@ Image GeneratePerlinNoiseHeightmap(int width, int height, float scale, int octav
             
             unsigned char value = (unsigned char)(noiseValue * 255);
             pixels[y * width + x] = ::Color{ value, value, value, 255 };
+            pixels[y * width + x] = {0,0,0,255};
         }
     }
     
@@ -685,11 +686,11 @@ int main() {
                 BodyID sphere_id = sphere_body->GetID();
                 body_interface.AddBody(sphere_id, EActivation::Activate);
                 
-                // Random color for the sphere
+                // Random color for the sphere // Greenish for dirt
                 ::Color sphereColor = {
-                    (unsigned char)GetRandomValue(100, 255),
-                    (unsigned char)GetRandomValue(100, 255),
-                    (unsigned char)GetRandomValue(100, 255),
+                    (unsigned char)0,
+                    (unsigned char)200,
+                    (unsigned char)0,
                     255
                 };
                 
