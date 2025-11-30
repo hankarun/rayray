@@ -612,17 +612,20 @@ int main() {
     
     // Create a cube model for the moving cube
     float cubeSize = 1.0f;
-    Model cubeModel = LoadModelFromMesh(GenMeshCube(cubeSize, cubeSize, cubeSize));
+    Model cubeModel = LoadModelFromMesh(GenMeshCube(cubeSize * 2.0f, cubeSize, cubeSize * 0.1f));
     cubeModel.materials[0].shader = shader;
     
     // Create physics body for the cube (kinematic so it can push spheres)
-    BoxShapeSettings cube_shape_settings(Vec3(cubeSize * 0.5f, cubeSize * 0.5f, cubeSize * 0.5f));
+    BoxShapeSettings cube_shape_settings(Vec3(cubeSize, cubeSize * 0.5f, cubeSize * 0.1f));
     ShapeSettings::ShapeResult cube_shape_result = cube_shape_settings.Create();
     ShapeRefC cube_shape = cube_shape_result.Get();
     
+    // 45 degree rotation around Y axis
+    Quat cubeRotation = Quat::sRotation(Vec3(0, 1, 0), 3.14159f / 4.0f);
+    
     BodyCreationSettings cube_body_settings(cube_shape,
         RVec3(-12.0f, 1.0f, 0.0f),
-        Quat::sIdentity(),
+        cubeRotation,
         EMotionType::Kinematic,
         Layers::MOVING);
     cube_body_settings.mFriction = 0.5f;
@@ -759,8 +762,11 @@ int main() {
             cubePosition.y = terrainHeightAtCube + cubeSize * 0.5f; // Place cube on top of terrain
         }
         
-        // Update cube physics body position (kinematic body)
-        body_interface.SetPosition(cube_body_id, RVec3(cubePosition.x, cubePosition.y, cubePosition.z), EActivation::Activate);
+        // Update cube physics body position and rotation (kinematic body)
+        body_interface.SetPositionAndRotation(cube_body_id, 
+            RVec3(cubePosition.x, cubePosition.y, cubePosition.z), 
+            cubeRotation, 
+            EActivation::Activate);
         // Set velocity so physics engine knows it's moving (helps with collision response)
         body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeSpeed, 0.0f, 0.0f));
         
@@ -994,8 +1000,8 @@ int main() {
             DrawModel(sphereModel, spherePos, 1.0f, sphere.color);
         }
         
-        // Draw the moving cube
-        DrawModel(cubeModel, cubePosition, 1.0f, ::BLUE);
+        // Draw the moving cube with 45 degree rotation
+        DrawModelEx(cubeModel, cubePosition, Vector3{0.0f, 1.0f, 0.0f}, 45.0f, Vector3{1.0f, 1.0f, 1.0f}, ::BLUE);
         
         EndMode3D();
 
