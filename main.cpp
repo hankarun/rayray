@@ -596,7 +596,8 @@ int main() {
     planeModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = heightmapTexture;
     
     // Create a sphere model for rendering
-    Model sphereModel = LoadModelFromMesh(GenMeshSphere(0.5f, 32, 32));
+    float sphereRadius = 0.1f;
+    Model sphereModel = LoadModelFromMesh(GenMeshSphere(sphereRadius, 32, 32));
     sphereModel.materials[0].shader = shader;
 
     // List to hold dynamic spheres
@@ -649,37 +650,51 @@ int main() {
                 }
             }
             
-            // Create sphere shape
-            SphereShapeSettings sphere_shape_settings(0.5f); // 0.5m radius
-            ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
-            ShapeRefC sphere_shape = sphere_shape_result.Get();
-            
-            // Create dynamic body for sphere at clicked position, 5m above terrain
-            BodyCreationSettings sphere_body_settings(sphere_shape,
-                RVec3(spawnPosition.x, spawnPosition.y, spawnPosition.z),
-                Quat::sIdentity(),
-                EMotionType::Dynamic,
-                Layers::MOVING);
-            
-            // Set high friction and damping to reduce rolling (act like lumps)
-            sphere_body_settings.mFriction = 50.0f; // Almost sticky friction
-            sphere_body_settings.mRestitution = 0.05f; // Very low bounce
-            sphere_body_settings.mLinearDamping = 2.0f; // Very high linear damping
-            sphere_body_settings.mAngularDamping = 5.0f; // Extremely high angular damping to stop rolling
-            
-            Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
-            BodyID sphere_id = sphere_body->GetID();
-            body_interface.AddBody(sphere_id, EActivation::Activate);
-            
-            // Random color for the sphere
-            ::Color sphereColor = {
-                (unsigned char)GetRandomValue(100, 255),
-                (unsigned char)GetRandomValue(100, 255),
-                (unsigned char)GetRandomValue(100, 255),
-                255
-            };
-            
-            dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false});
+            // Create 10 spheres in a cluster
+            for (int i = 0; i < 10; i++) {
+                // Random offset within a small radius
+                float offsetX = ((float)GetRandomValue(-50, 50) / 100.0f);
+                float offsetY = ((float)GetRandomValue(0, 100) / 100.0f);
+                float offsetZ = ((float)GetRandomValue(-50, 50) / 100.0f);
+                
+                Vector3 sphereSpawnPos = {
+                    spawnPosition.x + offsetX,
+                    spawnPosition.y + offsetY,
+                    spawnPosition.z + offsetZ
+                };
+                
+                // Create sphere shape
+                SphereShapeSettings sphere_shape_settings(sphereRadius); // 0.5m radius
+                ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
+                ShapeRefC sphere_shape = sphere_shape_result.Get();
+                
+                // Create dynamic body for sphere at clicked position, 5m above terrain
+                BodyCreationSettings sphere_body_settings(sphere_shape,
+                    RVec3(sphereSpawnPos.x, sphereSpawnPos.y, sphereSpawnPos.z),
+                    Quat::sIdentity(),
+                    EMotionType::Dynamic,
+                    Layers::MOVING);
+                
+                // Set high friction and damping to reduce rolling (act like lumps)
+                sphere_body_settings.mFriction = 50.0f; // Almost sticky friction
+                sphere_body_settings.mRestitution = 0.05f; // Very low bounce
+                sphere_body_settings.mLinearDamping = 2.0f; // Very high linear damping
+                sphere_body_settings.mAngularDamping = 5.0f; // Extremely high angular damping to stop rolling
+                
+                Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
+                BodyID sphere_id = sphere_body->GetID();
+                body_interface.AddBody(sphere_id, EActivation::Activate);
+                
+                // Random color for the sphere
+                ::Color sphereColor = {
+                    (unsigned char)GetRandomValue(100, 255),
+                    (unsigned char)GetRandomValue(100, 255),
+                    (unsigned char)GetRandomValue(100, 255),
+                    255
+                };
+                
+                dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false});
+            }
         }
 
         // Update physics (60 Hz simulation)
@@ -714,10 +729,9 @@ int main() {
             }
             
             // If sphere is touching terrain (within 0.6 units - sphere radius + small margin), add density
-            if (worldY - 0.5f <= terrainHeight + 0.1f) {
+            if (worldY - sphereRadius <= terrainHeight + 0.1f) {
                 // Add density to cellular automata grid
                 // Calculate sphere volume: (4/3) * π * r³
-                const float sphereRadius = 0.5f;
                 const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
                 
                 // Dirt properties: wider spread, lower viscosity for natural settling
@@ -781,7 +795,8 @@ int main() {
         }
 
         // Rotate light direction around a circle
-        lightAngle += 0.5f * GetFrameTime();
+        float lightSpeed = 0.0f;
+        lightAngle += lightSpeed * GetFrameTime();
         lightDirection.x = cosf(lightAngle);
         lightDirection.z = sinf(lightAngle);
         lightDirection.y = -0.5f;
@@ -813,8 +828,10 @@ int main() {
         
         EndMode3D();
 
-        DrawText("Right-click to drop a sphere from 5m high", 10, 10, 20, ::DARKGRAY);
-        DrawFPS(10, 40);
+        DrawText("Right-click to drop 10 spheres from 5m high", 10, 10, 20, ::DARKGRAY);
+        DrawText(TextFormat("Sphere Count: %d", (int)dynamicSpheres.size()), 10, 35, 16, ::DARKGRAY);
+        DrawText(TextFormat("Sphere Radius: %.2fm", sphereRadius), 10, 55, 16, ::DARKGRAY);
+        DrawFPS(10, 75);
 
         EndDrawing();
     }
