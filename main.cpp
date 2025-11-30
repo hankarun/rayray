@@ -130,7 +130,16 @@ struct PhysicsSphere
     ::Color color;
     float stoppedTimer; // Timer to track how long the sphere has been stopped
     bool markedForDestruction;
+    Vector3 lastPosition; // Track position for velocity check
 };
+
+// Helper to check if a sphere has stopped moving
+bool IsSphereStationary(const Vector3& currentPos, const Vector3& lastPos, float threshold = 0.01f) {
+    float dx = currentPos.x - lastPos.x;
+    float dy = currentPos.y - lastPos.y;
+    float dz = currentPos.z - lastPos.z;
+    return (dx * dx + dy * dy + dz * dz) < threshold * threshold;
+}
 
 // Cell structure for cellular automata
 struct DensityCell
@@ -600,6 +609,37 @@ int main() {
     float sphereRadius = 0.1f;
     Model sphereModel = LoadModelFromMesh(GenMeshSphere(sphereRadius, 32, 32));
     sphereModel.materials[0].shader = shader;
+    
+    // Create a cube model for the moving cube
+    float cubeSize = 1.0f;
+    Model cubeModel = LoadModelFromMesh(GenMeshCube(cubeSize, cubeSize, cubeSize));
+    cubeModel.materials[0].shader = shader;
+    
+    // Create physics body for the cube (kinematic so it can push spheres)
+    BoxShapeSettings cube_shape_settings(Vec3(cubeSize * 0.5f, cubeSize * 0.5f, cubeSize * 0.5f));
+    ShapeSettings::ShapeResult cube_shape_result = cube_shape_settings.Create();
+    ShapeRefC cube_shape = cube_shape_result.Get();
+    
+    BodyCreationSettings cube_body_settings(cube_shape,
+        RVec3(-12.0f, 1.0f, 0.0f),
+        Quat::sIdentity(),
+        EMotionType::Kinematic,
+        Layers::MOVING);
+    cube_body_settings.mFriction = 0.5f;
+    cube_body_settings.mRestitution = 0.1f;
+    
+    Body* cube_body = body_interface.CreateBody(cube_body_settings);
+    BodyID cube_body_id = cube_body->GetID();
+    body_interface.AddBody(cube_body_id, EActivation::Activate);
+    
+    // Moving cube properties
+    Vector3 cubePosition = { -12.0f, 1.0f, 0.0f }; // Start from left side
+    float cubeSpeed = 3.0f; // Units per second
+    float cubeMinX = -12.0f;
+    float cubeMaxX = 12.0f;
+    float cubeDigDepth = 0.3f; // How deep the cube digs into terrain
+    float sphereSpawnAccumulator = 0.0f; // Accumulate displaced volume for spawning spheres
+    const float stoppedTimeThreshold = 0.5f; // Time in seconds before sphere converts to earth
 
     // List to hold dynamic spheres
     std::vector<PhysicsSphere> dynamicSpheres;
@@ -694,7 +734,7 @@ int main() {
                     255
                 };
                 
-                dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false});
+                dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, spawnPosition});
             }
         }
 
@@ -703,10 +743,121 @@ int main() {
         const int collisionSteps = 1;
         physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
         
+        // Update moving cube position (left to right)
+        cubePosition.x += cubeSpeed * deltaTime;
+        if (cubePosition.x > cubeMaxX) {
+            cubePosition.x = cubeMinX; // Reset to left side
+        }
+        
+        // Sample terrain height at cube position to make it follow terrain
+        float cubeHmX = (cubePosition.x + 10.0f) / (20.0f / heightmapSize);
+        float cubeHmZ = (cubePosition.z + 10.0f) / (20.0f / heightmapSize);
+        int cubeIx = (int)cubeHmX;
+        int cubeIz = (int)cubeHmZ;
+        if (cubeIx >= 0 && cubeIx < heightmapSize && cubeIz >= 0 && cubeIz < heightmapSize) {
+            float terrainHeightAtCube = heightSamples[cubeIz * heightmapSize + cubeIx];
+            cubePosition.y = terrainHeightAtCube + cubeSize * 0.5f; // Place cube on top of terrain
+        }
+        
+        // Update cube physics body position (kinematic body)
+        body_interface.SetPosition(cube_body_id, RVec3(cubePosition.x, cubePosition.y, cubePosition.z), EActivation::Activate);
+        // Set velocity so physics engine knows it's moving (helps with collision response)
+        body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeSpeed, 0.0f, 0.0f));
+        
+        // Cube terrain deformation - dig into terrain and spawn spheres
+        // Only deform if cube is within terrain bounds
+        if (cubePosition.x >= -10.0f && cubePosition.x <= 10.0f &&
+            cubePosition.z >= -10.0f && cubePosition.z <= 10.0f) {
+            
+            // Calculate cube footprint in heightmap coordinates
+            float cubeHalfSize = cubeSize * 0.5f;
+            int hmMinX = (int)((cubePosition.x - cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
+            int hmMaxX = (int)((cubePosition.x + cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
+            int hmMinZ = (int)((cubePosition.z - cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
+            int hmMaxZ = (int)((cubePosition.z + cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
+            
+            float totalDisplacedVolume = 0.0f;
+            
+            // Dig terrain under the cube
+            for (int z = hmMinZ; z <= hmMaxZ; z++) {
+                for (int x = hmMinX; x <= hmMaxX; x++) {
+                    if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
+                        int idx = z * heightmapSize + x;
+                        float currentHeight = heightSamples[idx];
+                        float digAmount = cubeDigDepth * deltaTime * 5.0f; // Scale with frame time
+                        
+                        if (currentHeight > 0.0f) {
+                            float actualDig = fminf(digAmount, currentHeight);
+                            heightSamples[idx] -= actualDig;
+                            if (heightSamples[idx] < 0.0f) heightSamples[idx] = 0.0f;
+                            
+                            // Calculate displaced volume (per cell)
+                            float cellArea = terrainScale * terrainScale;
+                            totalDisplacedVolume += actualDig * cellArea;
+                        }
+                    }
+                }
+            }
+            
+            // Accumulate displaced volume and spawn spheres
+            sphereSpawnAccumulator += totalDisplacedVolume;
+            const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
+            
+            while (sphereSpawnAccumulator >= sphereVolume) {
+                sphereSpawnAccumulator -= sphereVolume;
+                
+                // Spawn sphere IN FRONT of the cube so it gets pushed
+                float spawnOffsetX = cubeHalfSize + sphereRadius + 0.15f; // In front of cube
+                float spawnOffsetZ = ((float)GetRandomValue(-50, 50) / 100.0f) * cubeHalfSize;
+                float spawnY = cubePosition.y - cubeHalfSize + sphereRadius;
+                
+                // Spawn in front of the cube (positive X direction since cube moves right)
+                Vector3 sphereSpawnPos = {
+                    cubePosition.x + spawnOffsetX, // Spawn IN FRONT of the cube
+                    spawnY + 0.3f,
+                    cubePosition.z + spawnOffsetZ
+                };
+                
+                // Create sphere shape
+                SphereShapeSettings sphere_shape_settings(sphereRadius);
+                ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
+                ShapeRefC sphere_shape = sphere_shape_result.Get();
+                
+                // Create dynamic body for sphere
+                BodyCreationSettings sphere_body_settings(sphere_shape,
+                    RVec3(sphereSpawnPos.x, sphereSpawnPos.y, sphereSpawnPos.z),
+                    Quat::sIdentity(),
+                    EMotionType::Dynamic,
+                    Layers::MOVING);
+                
+                sphere_body_settings.mFriction = 50.0f;
+                sphere_body_settings.mRestitution = 0.05f;
+                sphere_body_settings.mLinearDamping = 2.0f;
+                sphere_body_settings.mAngularDamping = 5.0f;
+                
+                Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
+                if (sphere_body != nullptr) {
+                    BodyID sphere_id = sphere_body->GetID();
+                    body_interface.AddBody(sphere_id, EActivation::Activate);
+                    
+                    // No initial velocity - cube will push the spheres
+                    
+                    ::Color sphereColor = {
+                        (unsigned char)139,
+                        (unsigned char)90,
+                        (unsigned char)43,
+                        255
+                    }; // Brown dirt color
+                    
+                    dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, sphereSpawnPos});
+                }
+            }
+        }
+        
         // Update density cellular automata
         densityGrid.Update(deltaTime, heightSamples, heightScale);
         
-        // Check for spheres touching terrain and add density
+        // Check for spheres touching terrain and track stopped time
         bool densityAdded = false;
         
         for (auto& sphere : dynamicSpheres) {
@@ -716,9 +867,9 @@ int main() {
             float worldX = (float)position.GetX();
             float worldY = (float)position.GetY();
             float worldZ = (float)position.GetZ();
+            Vector3 currentPos = { worldX, worldY, worldZ };
             
             // Check if sphere is touching or near the ground
-            // Sample heightmap at sphere position to see if it's close
             float terrainHeight = 0.0f;
             float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
             float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
@@ -729,19 +880,35 @@ int main() {
                 terrainHeight = heightSamples[iz * heightmapSize + ix];
             }
             
-            // If sphere is touching terrain (within 0.6 units - sphere radius + small margin), add density
-            if (worldY - sphereRadius <= terrainHeight + 0.1f) {
+            // Check if sphere is on or near terrain
+            bool onTerrain = (worldY - sphereRadius <= terrainHeight + 0.15f);
+            
+            // Check if sphere has stopped moving
+            if (onTerrain && IsSphereStationary(currentPos, sphere.lastPosition, 0.02f)) {
+                sphere.stoppedTimer += deltaTime;
+            } else {
+                sphere.stoppedTimer = 0.0f; // Reset timer if moving
+            }
+            
+            // Update last position
+            sphere.lastPosition = currentPos;
+            
+            // If sphere has been stopped long enough, convert to terrain
+            if (sphere.stoppedTimer >= stoppedTimeThreshold) {
                 // Add density to cellular automata grid
-                // Calculate sphere volume: (4/3) * π * r³
                 const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
                 
-                // Dirt properties: wider spread, lower viscosity for natural settling
-                // Spread over larger area (2.0 radius) to create gentler slopes
-                // Low viscosity (0.15) allows dirt to flow and settle naturally
-                float densityAmount = sphereVolume * 100.0f; // Scale up for CA conversion rate
+                // Convert sphere to terrain height
+                float densityAmount = sphereVolume * 100.0f;
                 ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
                               2.0f, densityAmount, 0.15f, terrainScale, heightmapSize);
                 densityAdded = true;
+                sphere.markedForDestruction = true;
+            }
+            
+            // Also destroy spheres that fall off the terrain
+            if (worldY < -5.0f || worldX < -15.0f || worldX > 15.0f || 
+                worldZ < -15.0f || worldZ > 15.0f) {
                 sphere.markedForDestruction = true;
             }
         }
@@ -827,6 +994,9 @@ int main() {
             DrawModel(sphereModel, spherePos, 1.0f, sphere.color);
         }
         
+        // Draw the moving cube
+        DrawModel(cubeModel, cubePosition, 1.0f, ::BLUE);
+        
         EndMode3D();
 
         DrawText("Right-click to drop 10 spheres from 5m high", 10, 10, 20, ::DARKGRAY);
@@ -842,6 +1012,8 @@ int main() {
         body_interface.RemoveBody(sphere.bodyID);
         body_interface.DestroyBody(sphere.bodyID);
     }
+    body_interface.RemoveBody(cube_body_id);
+    body_interface.DestroyBody(cube_body_id);
     body_interface.RemoveBody(heightmap_body->GetID());
     body_interface.DestroyBody(heightmap_body->GetID());
 
@@ -850,6 +1022,7 @@ int main() {
     UnloadShader(heightmapShader);
     UnloadTexture(heightmapTexture);
     UnloadModel(sphereModel);
+    UnloadModel(cubeModel);
     UnloadModel(planeModel);
 
     CloseWindow();
