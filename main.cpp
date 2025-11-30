@@ -471,10 +471,11 @@ int main() {
     JobSystemThreadPool job_system(cMaxPhysicsJobs, cMaxPhysicsBarriers, thread::hardware_concurrency() - 1);
 
     // Create physics system
-    const uint cMaxBodies = 1024;
+    const uint cMaxBodies = 2048;
     const uint cNumBodyMutexes = 0;
-    const uint cMaxBodyPairs = 1024;
-    const uint cMaxContactConstraints = 1024;
+    const uint cMaxBodyPairs = 4096;
+    const uint cMaxContactConstraints = 4096;
+    const int maxSphereCount = 200; // Limit sphere count to prevent physics overload
 
     BPLayerInterfaceImpl broad_phase_layer_interface;
     ObjectVsBroadPhaseLayerFilterImpl object_vs_broadphase_layer_filter;
@@ -820,7 +821,8 @@ int main() {
             sphereSpawnAccumulator += totalDisplacedVolume;
             const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
             
-            while (sphereSpawnAccumulator >= sphereVolume) {
+            // Limit sphere spawning if we have too many
+            while (sphereSpawnAccumulator >= sphereVolume && (int)dynamicSpheres.size() < maxSphereCount) {
                 sphereSpawnAccumulator -= sphereVolume;
                 
                 // Spawn sphere IN FRONT of the cube so it gets pushed
@@ -873,6 +875,28 @@ int main() {
         
         // Update density cellular automata
         densityGrid.Update(deltaTime, heightSamples, heightScale);
+        
+        // If too many spheres, force-convert the oldest stopped ones to terrain
+        if ((int)dynamicSpheres.size() > maxSphereCount - 20) {
+            // Find spheres that have been stopped for any amount of time and convert them
+            int converted = 0;
+            for (auto& sphere : dynamicSpheres) {
+                if (sphere.markedForDestruction) continue;
+                if (sphere.stoppedTimer > 0.1f && converted < 20) {
+                    // Force convert to terrain
+                    RVec3 pos = body_interface.GetPosition(sphere.bodyID);
+                    float worldX = (float)pos.GetX();
+                    float worldZ = (float)pos.GetZ();
+                    
+                    const float sphereVol = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
+                    float densityAmt = sphereVol * 100.0f;
+                    ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
+                                  2.0f, densityAmt, 0.15f, terrainScale, heightmapSize);
+                    sphere.markedForDestruction = true;
+                    converted++;
+                }
+            }
+        }
         
         // Check for spheres touching terrain and track stopped time
         bool densityAdded = false;
