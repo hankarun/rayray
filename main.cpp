@@ -612,12 +612,16 @@ int main() {
     sphereModel.materials[0].shader = shader;
     
     // Create a cube model for the moving cube
-    float cubeSize = 1.0f;
-    Model cubeModel = LoadModelFromMesh(GenMeshCube(cubeSize * 2.0f, cubeSize, cubeSize * 0.1f));
+    // Define cube half-extents for each axis
+    float cubeHalfX = 1.0f;   // Half width (X)
+    float cubeHalfY = 0.5f;   // Half height (Y)
+    float cubeHalfZ = 0.1f;   // Half depth (Z)
+    Model cubeModel = LoadModelFromMesh(GenMeshCube(cubeHalfX * 2.0f, cubeHalfY * 2.0f, cubeHalfZ * 2.0f));
     cubeModel.materials[0].shader = shader;
     
     // Create physics body for the cube (kinematic so it can push spheres)
-    BoxShapeSettings cube_shape_settings(Vec3(cubeSize, cubeSize * 0.5f, cubeSize * 0.1f));
+    // BoxShapeSettings takes half-extents
+    BoxShapeSettings cube_shape_settings(Vec3(cubeHalfX, cubeHalfY, cubeHalfZ));
     ShapeSettings::ShapeResult cube_shape_result = cube_shape_settings.Create();
     ShapeRefC cube_shape = cube_shape_result.Get();
     
@@ -649,6 +653,7 @@ int main() {
     float guiCubeStartX = -12.0f;
     float guiCubeStartZ = 0.0f;
     float guiCubeSpeed = 3.0f;
+    float guiCubeHeight = 0.0f; // Height offset for cube Y position
     bool showGui = true;
     int activeSlider = -1; // Track which slider is being dragged
     
@@ -792,15 +797,8 @@ int main() {
             cubeRotation = Quat::sRotation(Vec3(0, 1, 0), guiBladeRotation * 3.14159f / 180.0f);
         }
         
-        // Sample terrain height at cube position to make it follow terrain
-        float cubeHmX = (cubePosition.x + 10.0f) / (20.0f / heightmapSize);
-        float cubeHmZ = (cubePosition.z + 10.0f) / (20.0f / heightmapSize);
-        int cubeIx = (int)cubeHmX;
-        int cubeIz = (int)cubeHmZ;
-        if (cubeIx >= 0 && cubeIx < heightmapSize && cubeIz >= 0 && cubeIz < heightmapSize) {
-            float terrainHeightAtCube = heightSamples[cubeIz * heightmapSize + cubeIx];
-            cubePosition.y = terrainHeightAtCube + cubeSize * 0.5f; // Place cube on top of terrain
-        }
+        // Set cube Y position from height slider only (no terrain following)
+        cubePosition.y = cubeHalfY + guiCubeHeight;
         
         // Update cube physics body position and rotation (kinematic body)
         body_interface.SetPositionAndRotation(cube_body_id, 
@@ -818,35 +816,65 @@ int main() {
         }
         
         // Cube terrain deformation - dig into terrain and spawn spheres
-        // Only deform if cube is within terrain bounds
+        // Only deform if cube is within terrain bounds AND low enough to touch terrain
+        float cubeBottomY = cubePosition.y - cubeHalfY; // Bottom of the cube
         if (cubePosition.x >= -10.0f && cubePosition.x <= 10.0f &&
-            cubePosition.z >= -10.0f && cubePosition.z <= 10.0f) {
+            cubePosition.z >= -10.0f && cubePosition.z <= 10.0f &&
+            cubeBottomY < heightScale) { // Only dig if cube bottom is below max terrain height
             
-            // Calculate cube footprint in heightmap coordinates
-            float cubeHalfSize = cubeSize * 0.5f;
-            int hmMinX = (int)((cubePosition.x - cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
-            int hmMaxX = (int)((cubePosition.x + cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
-            int hmMinZ = (int)((cubePosition.z - cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
-            int hmMaxZ = (int)((cubePosition.z + cubeHalfSize + 10.0f) / (20.0f / heightmapSize));
+            // Calculate rotated cube footprint - account for blade rotation
+            float rotationRad = circleMode ? 
+                (circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f) : 
+                (guiBladeRotation * 3.14159f / 180.0f);
+            float cosR = cosf(rotationRad);
+            float sinR = sinf(rotationRad);
+            
+            // Calculate the 4 corners of the rotated cube footprint
+            float corners[4][2] = {
+                { cubeHalfX * cosR - cubeHalfZ * sinR,  cubeHalfX * sinR + cubeHalfZ * cosR},
+                {-cubeHalfX * cosR - cubeHalfZ * sinR, -cubeHalfX * sinR + cubeHalfZ * cosR},
+                { cubeHalfX * cosR + cubeHalfZ * sinR,  cubeHalfX * sinR - cubeHalfZ * cosR},
+                {-cubeHalfX * cosR + cubeHalfZ * sinR, -cubeHalfX * sinR - cubeHalfZ * cosR}
+            };
+            
+            // Find axis-aligned bounding box of rotated footprint
+            float minX = corners[0][0], maxX = corners[0][0];
+            float minZ = corners[0][1], maxZ = corners[0][1];
+            for (int i = 1; i < 4; i++) {
+                if (corners[i][0] < minX) minX = corners[i][0];
+                if (corners[i][0] > maxX) maxX = corners[i][0];
+                if (corners[i][1] < minZ) minZ = corners[i][1];
+                if (corners[i][1] > maxZ) maxZ = corners[i][1];
+            }
+            
+            // Calculate cube footprint in heightmap coordinates using rotated bounds
+            int hmMinX = (int)((cubePosition.x + minX + 10.0f) / (20.0f / heightmapSize));
+            int hmMaxX = (int)((cubePosition.x + maxX + 10.0f) / (20.0f / heightmapSize));
+            int hmMinZ = (int)((cubePosition.z + minZ + 10.0f) / (20.0f / heightmapSize));
+            int hmMaxZ = (int)((cubePosition.z + maxZ + 10.0f) / (20.0f / heightmapSize));
             
             float totalDisplacedVolume = 0.0f;
             
-            // Dig terrain under the cube
+            // Dig terrain under the cube - only if cube bottom is below terrain height at that point
             for (int z = hmMinZ; z <= hmMaxZ; z++) {
                 for (int x = hmMinX; x <= hmMaxX; x++) {
                     if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
                         int idx = z * heightmapSize + x;
                         float currentHeight = heightSamples[idx];
-                        float digAmount = cubeDigDepth * deltaTime * 5.0f; // Scale with frame time
                         
-                        if (currentHeight > 0.0f) {
-                            float actualDig = fminf(digAmount, currentHeight);
-                            heightSamples[idx] -= actualDig;
-                            if (heightSamples[idx] < 0.0f) heightSamples[idx] = 0.0f;
-                            
-                            // Calculate displaced volume (per cell)
-                            float cellArea = terrainScale * terrainScale;
-                            totalDisplacedVolume += actualDig * cellArea;
+                        // Only dig if cube bottom is below terrain at this point
+                        if (cubeBottomY < currentHeight && currentHeight > 0.0f) {
+                            float digAmount = cubeDigDepth * deltaTime * 5.0f; // Scale with frame time
+                            float actualDig = fminf(digAmount, currentHeight - cubeBottomY);
+                            actualDig = fminf(actualDig, currentHeight); // Don't go below 0
+                            if (actualDig > 0.0f) {
+                                heightSamples[idx] -= actualDig;
+                                if (heightSamples[idx] < 0.0f) heightSamples[idx] = 0.0f;
+                                
+                                // Calculate displaced volume (per cell)
+                                float cellArea = terrainScale * terrainScale;
+                                totalDisplacedVolume += actualDig * cellArea;
+                            }
                         }
                     }
                 }
@@ -861,9 +889,9 @@ int main() {
                 sphereSpawnAccumulator -= sphereVolume;
                 
                 // Spawn sphere IN FRONT of the cube so it gets pushed
-                float spawnOffsetX = cubeHalfSize + sphereRadius + 0.15f; // In front of cube
-                float spawnOffsetZ = ((float)GetRandomValue(-50, 50) / 100.0f) * cubeHalfSize;
-                float spawnY = cubePosition.y - cubeHalfSize + sphereRadius;
+                float spawnOffsetX = cubeHalfX + sphereRadius + 0.15f; // In front of cube
+                float spawnOffsetZ = ((float)GetRandomValue(-50, 50) / 100.0f) * cubeHalfZ;
+                float spawnY = cubePosition.y - cubeHalfY + sphereRadius;
                 
                 // Spawn in front of the cube (positive X direction since cube moves right)
                 Vector3 sphereSpawnPos = {
@@ -1058,7 +1086,7 @@ int main() {
         ClearBackground(::GRAY);
 
         BeginMode3D(camera);
-        DrawGrid(20, 1.0f);
+        //DrawGrid(20, 1.0f);
         
         // Draw the heightmap plane at the origin
         DrawModel(planeModel, Vector3{ 0.0f, 0.0f, 0.0f }, 1.0f, ::WHITE);
@@ -1090,7 +1118,7 @@ int main() {
             int panelX = screenWidth - 230;
             int panelY = 10;
             int panelW = 220;
-            int panelH = circleMode ? 260 : 200;
+            int panelH = circleMode ? 285 : 225;
             
             DrawRectangle(panelX, panelY, panelW, panelH, Fade(::LIGHTGRAY, 0.9f));
             DrawRectangleLines(panelX, panelY, panelW, panelH, ::DARKGRAY);
@@ -1235,6 +1263,33 @@ int main() {
                 }
                 DrawText(TextFormat("%.0f°", guiBladeRotation), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
             }
+            
+            // Slider 5: Height
+            {
+                int sliderX = panelX + 70;
+                int sliderY = sliderStartY + 100;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = -2.0f, maxVal = 5.0f;
+                
+                DrawText("Height:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiCubeHeight - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 11;
+                }
+                if (activeSlider == 11 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiCubeHeight = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.1f", guiCubeHeight), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
             } else {
                 // Circle mode sliders
                 // Center X
@@ -1371,12 +1426,39 @@ int main() {
                     }
                     DrawText(TextFormat("%.0f°", guiBladeRotation), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
                 }
+                
+                // Height
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 125;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = -2.0f, maxVal = 5.0f;
+                    
+                    DrawText("Height:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiCubeHeight - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 8;
+                    }
+                    if (activeSlider == 8 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiCubeHeight = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.1f", guiCubeHeight), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
             }
             
             if (mouseReleased) activeSlider = -1;
             
             // Current position display
-            int footerY = circleMode ? panelY + 195 : panelY + 135;
+            int footerY = circleMode ? panelY + 220 : panelY + 160;
             DrawText(TextFormat("Current: (%.1f, %.1f, %.1f)", cubePosition.x, cubePosition.y, cubePosition.z), 
                      panelX + 5, footerY, 10, ::BLUE);
             
