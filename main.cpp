@@ -440,6 +440,7 @@ int main() {
         Quat::sIdentity(), 
         EMotionType::Static, 
         Layers::NON_MOVING);
+    heightmap_body_settings.mFriction = 50.0f; // High friction for terrain
     Body* heightmap_body = body_interface.CreateBody(heightmap_body_settings);
     body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
     
@@ -478,10 +479,10 @@ int main() {
                 Layers::MOVING);
             
             // Set high friction and damping to reduce rolling (act like lumps)
-            sphere_body_settings.mFriction = 2.5f; // Very high friction
-            sphere_body_settings.mRestitution = 0.1f; // Low bounce
-            sphere_body_settings.mLinearDamping = 0.8f; // High linear damping
-            sphere_body_settings.mAngularDamping = 0.9f; // Very high angular damping to stop rolling
+            sphere_body_settings.mFriction = 50.0f; // Almost sticky friction
+            sphere_body_settings.mRestitution = 0.05f; // Very low bounce
+            sphere_body_settings.mLinearDamping = 2.0f; // Very high linear damping
+            sphere_body_settings.mAngularDamping = 5.0f; // Extremely high angular damping to stop rolling
             
             Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
             BodyID sphere_id = sphere_body->GetID();
@@ -504,52 +505,35 @@ int main() {
         physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
         
         // Check for stopped spheres and modify heightmap
-        const float stoppedVelocityThreshold = 0.1f; // Velocity below this is considered stopped
-        const float stoppedTimeRequired = 0.5f; // Seconds sphere must be stopped before modification
         bool heightmapModified = false;
         
         for (auto& sphere : dynamicSpheres) {
             if (sphere.markedForDestruction) continue;
             
-            // Get sphere velocity
-            Vec3 velocity = body_interface.GetLinearVelocity(sphere.bodyID);
-            float speed = velocity.Length();
+            RVec3 position = body_interface.GetPosition(sphere.bodyID);
+            float worldX = (float)position.GetX();
+            float worldY = (float)position.GetY();
+            float worldZ = (float)position.GetZ();
             
-            // Check if sphere is moving slowly
-            if (speed < stoppedVelocityThreshold) {
-                sphere.stoppedTimer += deltaTime;
-                
-                // If stopped long enough, modify heightmap and mark for destruction
-                if (sphere.stoppedTimer >= stoppedTimeRequired) {
-                    RVec3 position = body_interface.GetPosition(sphere.bodyID);
-                    float worldX = (float)position.GetX();
-                    float worldY = (float)position.GetY();
-                    float worldZ = (float)position.GetZ();
-                    
-                    // Check if sphere is touching or near the ground
-                    // Sample heightmap at sphere position to see if it's close
-                    float terrainHeight = 0.0f;
-                    float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
-                    float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
-                    int ix = (int)hmX;
-                    int iz = (int)hmZ;
-                    
-                    if (ix >= 0 && ix < heightmapSize && iz >= 0 && iz < heightmapSize) {
-                        terrainHeight = heightSamples[iz * heightmapSize + ix];
-                    }
-                    
-                    // If sphere is close to terrain (within 1 unit), modify heightmap
-                    if (worldY - 0.5f <= terrainHeight + 1.0f) {
-                        // Modify heightmap
-                        ModifyHeightmap(heightSamples, heightmapSize, worldX, worldZ, 
-                                      1.5f, 0.3f, terrainScale, heightScale);
-                        heightmapModified = true;
-                        sphere.markedForDestruction = true;
-                    }
-                }
-            } else {
-                // Reset timer if sphere is still moving
-                sphere.stoppedTimer = 0.0f;
+            // Check if sphere is touching or near the ground
+            // Sample heightmap at sphere position to see if it's close
+            float terrainHeight = 0.0f;
+            float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
+            float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
+            int ix = (int)hmX;
+            int iz = (int)hmZ;
+            
+            if (ix >= 0 && ix < heightmapSize && iz >= 0 && iz < heightmapSize) {
+                terrainHeight = heightSamples[iz * heightmapSize + ix];
+            }
+            
+            // If sphere is touching terrain (within 0.6 units - sphere radius + small margin), merge immediately
+            if (worldY - 0.5f <= terrainHeight + 0.1f) {
+                // Modify heightmap
+                ModifyHeightmap(heightSamples, heightmapSize, worldX, worldZ, 
+                              1.5f, 0.3f, terrainScale, heightScale);
+                heightmapModified = true;
+                sphere.markedForDestruction = true;
             }
         }
         
@@ -571,6 +555,7 @@ int main() {
                 Quat::sIdentity(), 
                 EMotionType::Static, 
                 Layers::NON_MOVING);
+            new_heightmap_body_settings.mFriction = 5.0f; // High friction for terrain
             heightmap_body = body_interface.CreateBody(new_heightmap_body_settings);
             body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
             
