@@ -96,11 +96,9 @@ int main() {
         BeginMode3D(camera);
         DrawGrid(20, 1.0f);
         
-        // Draw cube with shader
         Vector3 cubePos = { 0.0f, 0.5f, 0.0f };
         DrawModel(model, cubePos, 1.0f, WHITE);
         
-        // Draw spheres to show lighting better
         Vector3 sphere1Pos = { -2.5f, 0.5f, 0.0f };
         Vector3 sphere2Pos = { 2.5f, 0.5f, 0.0f };
         DrawModel(sphere, sphere1Pos, 1.0f, RED);
@@ -109,7 +107,6 @@ int main() {
         EndMode3D();
 
         DrawFPS(10, 40);
-        DrawText("Directional Light Shader", 10, 10, 20, DARKGRAY);
 
         EndDrawing();
     }
