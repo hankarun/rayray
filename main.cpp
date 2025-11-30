@@ -4,6 +4,132 @@
 #include <cmath>
 #include <vector>
 
+// Jolt Physics includes
+#include <Jolt/Jolt.h>
+#include <Jolt/RegisterTypes.h>
+#include <Jolt/Core/Factory.h>
+#include <Jolt/Core/TempAllocator.h>
+#include <Jolt/Core/JobSystemThreadPool.h>
+#include <Jolt/Physics/PhysicsSettings.h>
+#include <Jolt/Physics/PhysicsSystem.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyActivationListener.h>
+
+// Jolt namespace
+using namespace JPH;
+
+// Layer definitions
+namespace Layers
+{
+    static constexpr ObjectLayer NON_MOVING = 0;
+    static constexpr ObjectLayer MOVING = 1;
+    static constexpr ObjectLayer NUM_LAYERS = 2;
+};
+
+// BroadPhaseLayerInterface implementation
+class BPLayerInterfaceImpl final : public BroadPhaseLayerInterface
+{
+public:
+    BPLayerInterfaceImpl()
+    {
+        mObjectToBroadPhase[Layers::NON_MOVING] = BroadPhaseLayer(0);
+        mObjectToBroadPhase[Layers::MOVING] = BroadPhaseLayer(1);
+    }
+
+    virtual uint GetNumBroadPhaseLayers() const override
+    {
+        return 2;
+    }
+
+    virtual BroadPhaseLayer GetBroadPhaseLayer(ObjectLayer inLayer) const override
+    {
+        return mObjectToBroadPhase[inLayer];
+    }
+
+#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
+    virtual const char* GetBroadPhaseLayerName(BroadPhaseLayer inLayer) const override
+    {
+        switch ((BroadPhaseLayer::Type)inLayer)
+        {
+        case 0: return "NON_MOVING";
+        case 1: return "MOVING";
+        default: return "INVALID";
+        }
+    }
+#endif
+
+private:
+    BroadPhaseLayer mObjectToBroadPhase[Layers::NUM_LAYERS];
+};
+
+// ObjectVsBroadPhaseLayerFilter implementation
+class ObjectVsBroadPhaseLayerFilterImpl : public ObjectVsBroadPhaseLayerFilter
+{
+public:
+    virtual bool ShouldCollide(ObjectLayer inLayer1, BroadPhaseLayer inLayer2) const override
+    {
+        switch (inLayer1)
+        {
+        case Layers::NON_MOVING:
+            return inLayer2 == BroadPhaseLayer(1);
+        case Layers::MOVING:
+            return true;
+        default:
+            return false;
+        }
+    }
+};
+
+// ObjectLayerPairFilter implementation
+class ObjectLayerPairFilterImpl : public ObjectLayerPairFilter
+{
+public:
+    virtual bool ShouldCollide(ObjectLayer inObject1, ObjectLayer inObject2) const override
+    {
+        switch (inObject1)
+        {
+        case Layers::NON_MOVING:
+            return inObject2 == Layers::MOVING;
+        case Layers::MOVING:
+            return true;
+        default:
+            return false;
+        }
+    }
+};
+
+// Contact listener (optional, for debugging)
+class MyContactListener : public ContactListener
+{
+public:
+    virtual ValidateResult OnContactValidate(const Body &inBody1, const Body &inBody2, RVec3Arg inBaseOffset, const CollideShapeResult &inCollisionResult) override
+    {
+        return ValidateResult::AcceptAllContactsForThisBodyPair;
+    }
+
+    virtual void OnContactAdded(const Body &inBody1, const Body &inBody2, const ContactManifold &inManifold, ContactSettings &ioSettings) override
+    {
+    }
+
+    virtual void OnContactPersisted(const Body &inBody1, const Body &inBody2, const ContactManifold &inManifold, ContactSettings &ioSettings) override
+    {
+    }
+
+    virtual void OnContactRemoved(const SubShapeIDPair &inSubShapePair) override
+    {
+    }
+};
+
+// Structure to hold sphere data
+struct PhysicsSphere
+{
+    BodyID bodyID;
+    ::Color color;
+};
+
 // Perlin noise implementation
 float PerlinFade(float t) {
     return t * t * t * (t * (t * 6 - 15) + 10);
@@ -88,8 +214,8 @@ public:
 
 Image GeneratePerlinNoiseHeightmap(int width, int height, float scale, int octaves, float persistence) {
     PerlinNoise perlin;
-    Image image = GenImageColor(width, height, BLACK);
-    Color* pixels = LoadImageColors(image);
+    Image image = GenImageColor(width, height, ::BLACK);
+    ::Color* pixels = LoadImageColors(image);
     
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
@@ -101,7 +227,7 @@ Image GeneratePerlinNoiseHeightmap(int width, int height, float scale, int octav
             noiseValue = (noiseValue + 1.0f) / 2.0f;
             
             unsigned char value = (unsigned char)(noiseValue * 255);
-            pixels[y * width + x] = Color{ value, value, value, 255 };
+            pixels[y * width + x] = ::Color{ value, value, value, 255 };
         }
     }
     
@@ -146,7 +272,38 @@ int main() {
     const int screenWidth = 800;
     const int screenHeight = 450;
 
-    InitWindow(screenWidth, screenHeight, "Directional Light Shader - raylib");
+    InitWindow(screenWidth, screenHeight, "Jolt Physics with Heightmap - raylib");
+
+    // Initialize Jolt Physics
+    RegisterDefaultAllocator();
+    Factory::sInstance = new Factory();
+    RegisterTypes();
+
+    // Create temp allocator
+    TempAllocatorImpl temp_allocator(10 * 1024 * 1024);
+
+    // Create job system
+    JobSystemThreadPool job_system(cMaxPhysicsJobs, cMaxPhysicsBarriers, thread::hardware_concurrency() - 1);
+
+    // Create physics system
+    const uint cMaxBodies = 1024;
+    const uint cNumBodyMutexes = 0;
+    const uint cMaxBodyPairs = 1024;
+    const uint cMaxContactConstraints = 1024;
+
+    BPLayerInterfaceImpl broad_phase_layer_interface;
+    ObjectVsBroadPhaseLayerFilterImpl object_vs_broadphase_layer_filter;
+    ObjectLayerPairFilterImpl object_vs_object_layer_filter;
+
+    PhysicsSystem physics_system;
+    physics_system.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints,
+        broad_phase_layer_interface, object_vs_broadphase_layer_filter, object_vs_object_layer_filter);
+
+    // Contact listener
+    MyContactListener contact_listener;
+    physics_system.SetContactListener(&contact_listener);
+
+    BodyInterface &body_interface = physics_system.GetBodyInterface();
 
     Camera3D camera = { 0 };
     camera.position = Vector3{ 10.0f, 10.0f, 10.0f };
@@ -219,6 +376,37 @@ int main() {
     Image heightmapImage = GeneratePerlinNoiseHeightmap(heightmapSize, heightmapSize, 5.0f, 6, 0.5f);
     Texture2D heightmapTexture = LoadTextureFromImage(heightmapImage);
     SetTextureFilter(heightmapTexture, TEXTURE_FILTER_BILINEAR);
+    
+    // Create heightmap collision shape from the image
+    std::vector<float> heightSamples;
+    heightSamples.resize(heightmapSize * heightmapSize);
+    ::Color* pixels = LoadImageColors(heightmapImage);
+    
+    for (int y = 0; y < heightmapSize; y++) {
+        for (int x = 0; x < heightmapSize; x++) {
+            // Convert grayscale to height (0-1 range scaled by heightScale)
+            float height = (pixels[y * heightmapSize + x].r / 255.0f) * heightScale;
+            heightSamples[y * heightmapSize + x] = height;
+        }
+    }
+    UnloadImageColors(pixels);
+    
+    // Create Jolt HeightFieldShape
+    float terrainScale = 20.0f / (float)heightmapSize; // Map to 20x20 world units
+    HeightFieldShapeSettings heightfield_settings(heightSamples.data(), Vec3(0, 0, 0), 
+        Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
+    ShapeSettings::ShapeResult heightfield_shape_result = heightfield_settings.Create();
+    ShapeRefC heightfield_shape = heightfield_shape_result.Get();
+    
+    // Create static body for heightmap
+    BodyCreationSettings heightmap_body_settings(heightfield_shape, 
+        RVec3(-10.0, 0.0, -10.0), // Position to center the heightmap
+        Quat::sIdentity(), 
+        EMotionType::Static, 
+        Layers::NON_MOVING);
+    Body* heightmap_body = body_interface.CreateBody(heightmap_body_settings);
+    body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
+    
     UnloadImage(heightmapImage);
     
     // Create plane mesh with high resolution for smooth heightmap displacement
@@ -227,18 +415,51 @@ int main() {
     planeModel.materials[0].shader = heightmapShader;
     planeModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = heightmapTexture;
     
-    // Create a model to apply the shader to
-    Model model = LoadModelFromMesh(GenMeshCube(1.0f, 1.0f, 1.0f));
-    model.materials[0].shader = shader;
-    
-    // Create a sphere model
-    Model sphere = LoadModelFromMesh(GenMeshSphere(0.5f, 32, 32));
-    sphere.materials[0].shader = shader;
+    // Create a sphere model for rendering
+    Model sphereModel = LoadModelFromMesh(GenMeshSphere(0.5f, 32, 32));
+    sphereModel.materials[0].shader = shader;
+
+    // List to hold dynamic spheres
+    std::vector<PhysicsSphere> dynamicSpheres;
 
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
         UpdateOrbitalCamera(&camera, &cameraYaw, &cameraPitch, &cameraRadius, &previousMousePos);
+
+        // Mouse click to spawn sphere at center, 5m high
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            // Create sphere shape
+            SphereShapeSettings sphere_shape_settings(0.5f); // 0.5m radius
+            ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
+            ShapeRefC sphere_shape = sphere_shape_result.Get();
+            
+            // Create dynamic body for sphere at center, 5m high
+            BodyCreationSettings sphere_body_settings(sphere_shape,
+                RVec3(0.0, 5.0, 0.0), // Position: center, 5m high
+                Quat::sIdentity(),
+                EMotionType::Dynamic,
+                Layers::MOVING);
+            
+            Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
+            BodyID sphere_id = sphere_body->GetID();
+            body_interface.AddBody(sphere_id, EActivation::Activate);
+            
+            // Random color for the sphere
+            ::Color sphereColor = {
+                (unsigned char)GetRandomValue(100, 255),
+                (unsigned char)GetRandomValue(100, 255),
+                (unsigned char)GetRandomValue(100, 255),
+                255
+            };
+            
+            dynamicSpheres.push_back({sphere_id, sphereColor});
+        }
+
+        // Update physics (60 Hz simulation)
+        const float deltaTime = GetFrameTime();
+        const int collisionSteps = 1;
+        physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
 
         // Rotate light direction around a circle
         lightAngle += 0.5f * GetFrameTime();
@@ -256,35 +477,42 @@ int main() {
         SetShaderValue(heightmapShader, hm_viewPosLoc, &camera.position, SHADER_UNIFORM_VEC3);
 
         BeginDrawing();
-        ClearBackground(GRAY);
+        ClearBackground(::GRAY);
 
         BeginMode3D(camera);
         DrawGrid(20, 1.0f);
         
         // Draw the heightmap plane at the origin
-        DrawModel(planeModel, Vector3{ 0.0f, 0.0f, 0.0f }, 1.0f, WHITE);
+        DrawModel(planeModel, Vector3{ 0.0f, 0.0f, 0.0f }, 1.0f, ::WHITE);
         
-        Vector3 cubePos = { 0.0f, 3.0f, 0.0f };
-        DrawModel(model, cubePos, 1.0f, WHITE);
-        
-        Vector3 sphere1Pos = { -2.5f, 3.0f, 0.0f };
-        Vector3 sphere2Pos = { 2.5f, 3.0f, 0.0f };
-        DrawModel(sphere, sphere1Pos, 1.0f, RED);
-        DrawModel(sphere, sphere2Pos, 1.0f, BLUE);
+        // Draw all dynamic spheres
+        for (const auto& sphere : dynamicSpheres) {
+            RVec3 position = body_interface.GetPosition(sphere.bodyID);
+            Vector3 spherePos = { (float)position.GetX(), (float)position.GetY(), (float)position.GetZ() };
+            DrawModel(sphereModel, spherePos, 1.0f, sphere.color);
+        }
         
         EndMode3D();
 
+        DrawText("Right-click to drop a sphere from 5m high", 10, 10, 20, ::DARKGRAY);
         DrawFPS(10, 40);
 
         EndDrawing();
     }
 
+    // Cleanup physics
+    for (const auto& sphere : dynamicSpheres) {
+        body_interface.RemoveBody(sphere.bodyID);
+        body_interface.DestroyBody(sphere.bodyID);
+    }
+    body_interface.RemoveBody(heightmap_body->GetID());
+    body_interface.DestroyBody(heightmap_body->GetID());
+
     // Unload shader and models
     UnloadShader(shader);
     UnloadShader(heightmapShader);
     UnloadTexture(heightmapTexture);
-    UnloadModel(model);
-    UnloadModel(sphere);
+    UnloadModel(sphereModel);
     UnloadModel(planeModel);
 
     CloseWindow();
