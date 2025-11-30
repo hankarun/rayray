@@ -185,7 +185,6 @@ int main() {
     int hm_specularStrengthLoc = GetShaderLocation(heightmapShader, "specularStrength");
     int hm_shininessLoc = GetShaderLocation(heightmapShader, "shininess");
     int hm_heightScaleLoc = GetShaderLocation(heightmapShader, "heightScale");
-    int hm_heightmapTexLoc = GetShaderLocation(heightmapShader, "heightmapTexture");
     
     // Set up directional light properties
     Vector3 lightDirection = { -0.5f, -1.0f, -0.3f };
