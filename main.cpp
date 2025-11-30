@@ -651,6 +651,14 @@ int main() {
     float guiCubeSpeed = 3.0f;
     bool showGui = true;
     int activeSlider = -1; // Track which slider is being dragged
+    
+    // Circle mode settings
+    bool circleMode = false; // false = linear, true = circle
+    float guiCircleCenterX = 0.0f;
+    float guiCircleCenterZ = 0.0f;
+    float guiCircleRadius = 5.0f;
+    float guiBladeRotation = 45.0f; // Rotation angle in degrees
+    float circleAngle = 0.0f; // Current angle for circle movement
 
     // List to hold dynamic spheres
     std::vector<PhysicsSphere> dynamicSpheres;
@@ -754,14 +762,34 @@ int main() {
         const int collisionSteps = 1;
         physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
         
-        // Update moving cube position (left to right)
-        cubePosition.x += cubeSpeed * deltaTime;
-        if (cubePosition.x > cubeMaxX) {
-            // Reset cube with GUI values
-            cubePosition.x = guiCubeStartX;
-            cubePosition.z = guiCubeStartZ;
-            cubeSpeed = guiCubeSpeed;
-            cubeMinX = guiCubeStartX;
+        // Update moving cube position based on mode
+        if (circleMode) {
+            // Circle mode: rotate around center point
+            float angularSpeed = cubeSpeed / guiCircleRadius; // radians per second
+            circleAngle += angularSpeed * deltaTime;
+            if (circleAngle > 2.0f * 3.14159f) {
+                circleAngle -= 2.0f * 3.14159f;
+            }
+            
+            cubePosition.x = guiCircleCenterX + guiCircleRadius * cosf(circleAngle);
+            cubePosition.z = guiCircleCenterZ + guiCircleRadius * sinf(circleAngle);
+            
+            // Update cube rotation to be tangent to circle + blade rotation
+            float tangentAngle = circleAngle + 3.14159f / 2.0f; // Perpendicular to radius
+            float totalRotation = tangentAngle + guiBladeRotation * 3.14159f / 180.0f;
+            cubeRotation = Quat::sRotation(Vec3(0, 1, 0), totalRotation);
+        } else {
+            // Linear mode: move left to right
+            cubePosition.x += cubeSpeed * deltaTime;
+            if (cubePosition.x > cubeMaxX) {
+                // Reset cube with GUI values
+                cubePosition.x = guiCubeStartX;
+                cubePosition.z = guiCubeStartZ;
+                cubeSpeed = guiCubeSpeed;
+                cubeMinX = guiCubeStartX;
+            }
+            // Update rotation from GUI
+            cubeRotation = Quat::sRotation(Vec3(0, 1, 0), guiBladeRotation * 3.14159f / 180.0f);
         }
         
         // Sample terrain height at cube position to make it follow terrain
@@ -780,7 +808,14 @@ int main() {
             cubeRotation, 
             EActivation::Activate);
         // Set velocity so physics engine knows it's moving (helps with collision response)
-        body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeSpeed, 0.0f, 0.0f));
+        if (circleMode) {
+            // Tangent velocity for circle motion
+            float vx = -cubeSpeed * sinf(circleAngle);
+            float vz = cubeSpeed * cosf(circleAngle);
+            body_interface.SetLinearVelocity(cube_body_id, Vec3(vx, 0.0f, vz));
+        } else {
+            body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeSpeed, 0.0f, 0.0f));
+        }
         
         // Cube terrain deformation - dig into terrain and spawn spheres
         // Only deform if cube is within terrain bounds
@@ -1035,8 +1070,10 @@ int main() {
             DrawModel(sphereModel, spherePos, 1.0f, sphere.color);
         }
         
-        // Draw the moving cube with 45 degree rotation
-        DrawModelEx(cubeModel, cubePosition, Vector3{0.0f, 1.0f, 0.0f}, 45.0f, Vector3{1.0f, 1.0f, 1.0f}, ::BLUE);
+        // Draw the moving cube with rotation from GUI
+        float visualRotation = circleMode ? 
+            (circleAngle * 180.0f / 3.14159f + 90.0f + guiBladeRotation) : guiBladeRotation;
+        DrawModelEx(cubeModel, cubePosition, Vector3{0.0f, 1.0f, 0.0f}, visualRotation, Vector3{1.0f, 1.0f, 1.0f}, ::BLUE);
         
         EndMode3D();
 
@@ -1053,22 +1090,48 @@ int main() {
             int panelX = screenWidth - 230;
             int panelY = 10;
             int panelW = 220;
-            int panelH = 160;
+            int panelH = circleMode ? 260 : 200;
             
             DrawRectangle(panelX, panelY, panelW, panelH, Fade(::LIGHTGRAY, 0.9f));
             DrawRectangleLines(panelX, panelY, panelW, panelH, ::DARKGRAY);
-            DrawText("Cube Settings (next reset)", panelX + 5, panelY + 5, 10, ::DARKGRAY);
+            DrawText("Cube Settings", panelX + 5, panelY + 5, 10, ::DARKGRAY);
             
             Vector2 mousePos = GetMousePosition();
             bool mouseDown = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
             bool mousePressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
             bool mouseReleased = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
             
-            // Custom slider helper lambda-like logic
-            // Slider 1: Start X
+            // Mode toggle button
+            {
+                int btnX = panelX + 5;
+                int btnY = panelY + 22;
+                int btnW = 100;
+                int btnH = 18;
+                Rectangle btnRect = { (float)btnX, (float)btnY, (float)btnW, (float)btnH };
+                
+                DrawRectangle(btnX, btnY, btnW, btnH, circleMode ? ::GREEN : ::MAROON);
+                DrawRectangleLines(btnX, btnY, btnW, btnH, ::DARKGRAY);
+                DrawText(circleMode ? "Circle Mode" : "Linear Mode", btnX + 10, btnY + 4, 10, ::WHITE);
+                
+                if (CheckCollisionPointRec(mousePos, btnRect) && mousePressed) {
+                    circleMode = !circleMode;
+                    if (circleMode) {
+                        // Initialize circle position
+                        circleAngle = 0.0f;
+                        cubePosition.x = guiCircleCenterX + guiCircleRadius;
+                        cubePosition.z = guiCircleCenterZ;
+                    }
+                }
+            }
+            
+            int sliderStartY = panelY + 45;
+            
+            if (!circleMode) {
+                // Linear mode sliders
+                // Slider 1: Start X
             {
                 int sliderX = panelX + 70;
-                int sliderY = panelY + 30;
+                int sliderY = sliderStartY;
                 int sliderW = 120;
                 int sliderH = 16;
                 float minVal = -12.0f, maxVal = 12.0f;
@@ -1095,7 +1158,7 @@ int main() {
             // Slider 2: Start Z
             {
                 int sliderX = panelX + 70;
-                int sliderY = panelY + 55;
+                int sliderY = sliderStartY + 25;
                 int sliderW = 120;
                 int sliderH = 16;
                 float minVal = -10.0f, maxVal = 10.0f;
@@ -1122,7 +1185,7 @@ int main() {
             // Slider 3: Speed
             {
                 int sliderX = panelX + 70;
-                int sliderY = panelY + 80;
+                int sliderY = sliderStartY + 50;
                 int sliderW = 120;
                 int sliderH = 16;
                 float minVal = 0.5f, maxVal = 10.0f;
@@ -1146,14 +1209,179 @@ int main() {
                 DrawText(TextFormat("%.1f", guiCubeSpeed), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
             }
             
+            // Slider 4: Blade Rotation
+            {
+                int sliderX = panelX + 70;
+                int sliderY = sliderStartY + 75;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = 0.0f, maxVal = 90.0f;
+                
+                DrawText("Rotation:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiBladeRotation - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 10;
+                }
+                if (activeSlider == 10 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiBladeRotation = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.0f°", guiBladeRotation), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
+            } else {
+                // Circle mode sliders
+                // Center X
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = -8.0f, maxVal = 8.0f;
+                    
+                    DrawText("Center X:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiCircleCenterX - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 3;
+                    }
+                    if (activeSlider == 3 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiCircleCenterX = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.1f", guiCircleCenterX), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
+                
+                // Center Z
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 25;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = -8.0f, maxVal = 8.0f;
+                    
+                    DrawText("Center Z:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiCircleCenterZ - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 4;
+                    }
+                    if (activeSlider == 4 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiCircleCenterZ = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.1f", guiCircleCenterZ), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
+                
+                // Radius
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 50;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = 1.0f, maxVal = 9.0f;
+                    
+                    DrawText("Radius:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiCircleRadius - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 5;
+                    }
+                    if (activeSlider == 5 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiCircleRadius = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.1f", guiCircleRadius), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
+                
+                // Speed
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 75;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = 0.5f, maxVal = 10.0f;
+                    
+                    DrawText("Speed:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiCubeSpeed - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 6;
+                    }
+                    if (activeSlider == 6 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiCubeSpeed = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.1f", guiCubeSpeed), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
+                
+                // Blade Rotation
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 100;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = 0.0f, maxVal = 90.0f;
+                    
+                    DrawText("Rotation:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiBladeRotation - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 7;
+                    }
+                    if (activeSlider == 7 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiBladeRotation = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.0f°", guiBladeRotation), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
+            }
+            
             if (mouseReleased) activeSlider = -1;
             
             // Current position display
+            int footerY = circleMode ? panelY + 195 : panelY + 135;
             DrawText(TextFormat("Current: (%.1f, %.1f, %.1f)", cubePosition.x, cubePosition.y, cubePosition.z), 
-                     panelX + 5, panelY + 110, 10, ::BLUE);
+                     panelX + 5, footerY, 10, ::BLUE);
             
-            DrawText("Press G to toggle GUI", panelX + 5, panelY + 130, 10, ::GRAY);
-            DrawText("Settings apply on next reset", panelX + 5, panelY + 143, 10, ::GRAY);
+            DrawText("Press G to toggle GUI", panelX + 5, footerY + 20, 10, ::GRAY);
+            DrawText(circleMode ? "Circle mode active" : "Linear mode (resets at edge)", panelX + 5, footerY + 33, 10, ::GRAY);
         }
 
         EndDrawing();
