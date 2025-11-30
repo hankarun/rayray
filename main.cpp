@@ -132,6 +132,115 @@ struct PhysicsSphere
     bool markedForDestruction;
 };
 
+// Cell structure for cellular automata
+struct DensityCell
+{
+    float density;      // Material density at this cell
+    float viscosity;    // Viscosity of material (resistance to flow)
+};
+
+// Cellular Automata for density simulation
+class DensityAutomata
+{
+private:
+    std::vector<DensityCell> cells;
+    std::vector<DensityCell> nextCells;
+    int gridSize;
+    float cellSize;
+    
+public:
+    DensityAutomata(int size, float cellSz) : gridSize(size), cellSize(cellSz) {
+        cells.resize(size * size);
+        nextCells.resize(size * size);
+        
+        // Initialize all cells
+        for (int i = 0; i < size * size; i++) {
+            cells[i].density = 0.0f;
+            cells[i].viscosity = 0.5f; // Default viscosity
+        }
+    }
+    
+    void AddDensity(int x, int z, float amount, float visc = 0.5f) {
+        if (x >= 0 && x < gridSize && z >= 0 && z < gridSize) {
+            int idx = z * gridSize + x;
+            cells[idx].density += amount;
+            cells[idx].viscosity = visc;
+        }
+    }
+    
+    float GetDensity(int x, int z) const {
+        if (x >= 0 && x < gridSize && z >= 0 && z < gridSize) {
+            return cells[z * gridSize + x].density;
+        }
+        return 0.0f;
+    }
+    
+    // Cellular automata update step
+    void Update(float deltaTime, std::vector<float>& heightSamples, float heightScale) {
+        // Copy current state to next state
+        nextCells = cells;
+        
+        // Flow simulation based on density, viscosity, and height differences (like dirt)
+        for (int z = 0; z < gridSize; z++) {
+            for (int x = 0; x < gridSize; x++) {
+                int idx = z * gridSize + x;
+                DensityCell& cell = cells[idx];
+                
+                if (cell.density <= 0.01f) continue; // Skip empty cells
+                
+                // Calculate flow to neighbors based on density difference and viscosity
+                float flowRate = 1.5f * (1.0f - cell.viscosity) * deltaTime; // Increased flow rate
+                int neighbors[4][2] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+                
+                float currentHeight = heightSamples[idx];
+                
+                for (int n = 0; n < 4; n++) {
+                    int nx = x + neighbors[n][0];
+                    int nz = z + neighbors[n][1];
+                    
+                    if (nx >= 0 && nx < gridSize && nz >= 0 && nz < gridSize) {
+                        int nidx = nz * gridSize + nx;
+                        float neighborHeight = heightSamples[nidx];
+                        
+                        // Dirt flows based on both density and height differences (angle of repose)
+                        float densityDiff = cell.density - cells[nidx].density;
+                        float heightDiff = currentHeight - neighborHeight;
+                        
+                        // Simulate angle of repose - dirt flows down steep slopes
+                        const float angleOfRepose = 0.3f; // About 35 degrees in height units
+                        
+                        if (densityDiff > 0.0f || heightDiff > angleOfRepose) {
+                            float flow = (densityDiff * 0.3f + heightDiff * 0.7f) * flowRate * 0.25f;
+                            flow = fmaxf(0.0f, flow); // Only positive flow
+                            flow = fminf(flow, cell.density * 0.3f); // Don't flow more than 30% per neighbor
+                            
+                            nextCells[idx].density -= flow;
+                            nextCells[nidx].density += flow;
+                        }
+                    }
+                }
+                
+                // Apply density to height (higher density = higher terrain)
+                if (nextCells[idx].density > 0.1f) {
+                    float heightIncrease = nextCells[idx].density * 0.02f * deltaTime; // Faster settling
+                    heightSamples[idx] += heightIncrease;
+                    if (heightSamples[idx] > heightScale) {
+                        heightSamples[idx] = heightScale;
+                    }
+                    
+                    // Reduce density as it converts to height
+                    nextCells[idx].density *= 0.95f; // Faster conversion
+                }
+            }
+        }
+        
+        // Swap buffers
+        cells = nextCells;
+    }
+    
+    int GetGridSize() const { return gridSize; }
+};
+
 // Perlin noise implementation
 float PerlinFade(float t) {
     return t * t * t * (t * (t * 6 - 15) + 10);
@@ -213,6 +322,36 @@ public:
         return total / maxValue;
     }
 };
+
+void ModifyHeightmapWithDensity(DensityAutomata& densityGrid, float worldX, float worldZ, float radius, float densityAmount, float viscosity, float terrainScale, int heightmapSize) {
+    // Convert world position to heightmap coordinates
+    // Terrain is centered at origin, spans -10 to +10 in world space
+    float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
+    float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
+    
+    int centerX = (int)hmX;
+    int centerZ = (int)hmZ;
+    int radiusInSamples = (int)(radius / terrainScale);
+    
+    // Add density in a circular area
+    for (int z = centerZ - radiusInSamples; z <= centerZ + radiusInSamples; z++) {
+        for (int x = centerX - radiusInSamples; x <= centerX + radiusInSamples; x++) {
+            if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
+                float dx = x - hmX;
+                float dz = z - hmZ;
+                float dist = sqrtf(dx * dx + dz * dz);
+                
+                if (dist <= radiusInSamples) {
+                    // Smooth falloff based on distance
+                    float falloff = 1.0f - (dist / radiusInSamples);
+                    falloff = falloff * falloff; // Squared for smoother transition
+                    
+                    densityGrid.AddDensity(x, z, densityAmount * falloff, viscosity);
+                }
+            }
+        }
+    }
+}
 
 void ModifyHeightmap(std::vector<float>& heightSamples, int heightmapSize, float worldX, float worldZ, float radius, float heightIncrease, float terrainScale, float heightScale) {
     // Convert world position to heightmap coordinates
@@ -429,6 +568,10 @@ int main() {
     
     // Create Jolt HeightFieldShape
     float terrainScale = 20.0f / (float)heightmapSize; // Map to 20x20 world units
+    
+    // Initialize density cellular automata
+    DensityAutomata densityGrid(heightmapSize, terrainScale);
+    
     HeightFieldShapeSettings heightfield_settings(heightSamples.data(), Vec3(0, 0, 0), 
         Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
     ShapeSettings::ShapeResult heightfield_shape_result = heightfield_settings.Create();
@@ -464,16 +607,56 @@ int main() {
     while (!WindowShouldClose()) {
         UpdateOrbitalCamera(&camera, &cameraYaw, &cameraPitch, &cameraRadius, &previousMousePos);
 
-        // Mouse click to spawn sphere at center, 5m high
+        // Mouse click to spawn sphere at clicked terrain point, 5m above
         if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            // Get mouse ray for raycasting
+            Ray ray = GetMouseRay(GetMousePosition(), camera);
+            
+            // Raycast against the terrain to find intersection point
+            Vector3 spawnPosition = { 0.0f, 5.0f, 0.0f }; // Default position
+            bool hitTerrain = false;
+            
+            // Sample along the ray to find terrain intersection
+            float maxDistance = 100.0f;
+            float step = 0.5f;
+            for (float dist = 0.0f; dist < maxDistance; dist += step) {
+                Vector3 testPoint = {
+                    ray.position.x + ray.direction.x * dist,
+                    ray.position.y + ray.direction.y * dist,
+                    ray.position.z + ray.direction.z * dist
+                };
+                
+                // Check if point is within terrain bounds
+                if (testPoint.x >= -10.0f && testPoint.x <= 10.0f &&
+                    testPoint.z >= -10.0f && testPoint.z <= 10.0f) {
+                    
+                    // Sample heightmap at this position
+                    float hmX = (testPoint.x + 10.0f) / (20.0f / heightmapSize);
+                    float hmZ = (testPoint.z + 10.0f) / (20.0f / heightmapSize);
+                    int ix = (int)hmX;
+                    int iz = (int)hmZ;
+                    
+                    if (ix >= 0 && ix < heightmapSize && iz >= 0 && iz < heightmapSize) {
+                        float terrainHeight = heightSamples[iz * heightmapSize + ix];
+                        
+                        // Check if ray point is below terrain surface
+                        if (testPoint.y <= terrainHeight) {
+                            spawnPosition = { testPoint.x, terrainHeight + 5.0f, testPoint.z };
+                            hitTerrain = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
             // Create sphere shape
             SphereShapeSettings sphere_shape_settings(0.5f); // 0.5m radius
             ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
             ShapeRefC sphere_shape = sphere_shape_result.Get();
             
-            // Create dynamic body for sphere at center, 5m high
+            // Create dynamic body for sphere at clicked position, 5m above terrain
             BodyCreationSettings sphere_body_settings(sphere_shape,
-                RVec3(0.0, 5.0, 0.0), // Position: center, 5m high
+                RVec3(spawnPosition.x, spawnPosition.y, spawnPosition.z),
                 Quat::sIdentity(),
                 EMotionType::Dynamic,
                 Layers::MOVING);
@@ -504,8 +687,11 @@ int main() {
         const int collisionSteps = 1;
         physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
         
-        // Check for stopped spheres and modify heightmap
-        bool heightmapModified = false;
+        // Update density cellular automata
+        densityGrid.Update(deltaTime, heightSamples, heightScale);
+        
+        // Check for spheres touching terrain and add density
+        bool densityAdded = false;
         
         for (auto& sphere : dynamicSpheres) {
             if (sphere.markedForDestruction) continue;
@@ -527,18 +713,30 @@ int main() {
                 terrainHeight = heightSamples[iz * heightmapSize + ix];
             }
             
-            // If sphere is touching terrain (within 0.6 units - sphere radius + small margin), merge immediately
+            // If sphere is touching terrain (within 0.6 units - sphere radius + small margin), add density
             if (worldY - 0.5f <= terrainHeight + 0.1f) {
-                // Modify heightmap
-                ModifyHeightmap(heightSamples, heightmapSize, worldX, worldZ, 
-                              1.5f, 0.3f, terrainScale, heightScale);
-                heightmapModified = true;
+                // Add density to cellular automata grid
+                // Calculate sphere volume: (4/3) * π * r³
+                const float sphereRadius = 0.5f;
+                const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
+                
+                // Dirt properties: wider spread, lower viscosity for natural settling
+                // Spread over larger area (2.0 radius) to create gentler slopes
+                // Low viscosity (0.15) allows dirt to flow and settle naturally
+                float densityAmount = sphereVolume * 100.0f; // Scale up for CA conversion rate
+                ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
+                              2.0f, densityAmount, 0.15f, terrainScale, heightmapSize);
+                densityAdded = true;
                 sphere.markedForDestruction = true;
             }
         }
         
-        // If heightmap was modified, recreate the physics body
-        if (heightmapModified) {
+        // Recreate physics body periodically to match CA updates (every few frames)
+        static int frameCounter = 0;
+        frameCounter++;
+        bool shouldUpdatePhysics = densityAdded || (frameCounter % 10 == 0); // Update every 10 frames
+        
+        if (shouldUpdatePhysics) {
             // Remove old heightmap body
             body_interface.RemoveBody(heightmap_body->GetID());
             body_interface.DestroyBody(heightmap_body->GetID());
