@@ -644,17 +644,26 @@ int main() {
     // Moving cube properties
     Vector3 cubePosition = { -12.0f, 1.0f, 0.0f }; // Start from left side
     float cubeSpeed = 3.0f; // Units per second
+    float cubeCurrentSpeed = 3.0f; // Actual current speed (affected by resistance)
     float cubeMinX = -12.0f;
     float cubeMaxX = 12.0f;
     float cubeDigDepth = 0.3f; // How deep the cube digs into terrain
     float sphereSpawnAccumulator = 0.0f; // Accumulate displaced volume for spawning spheres
     const float stoppedTimeThreshold = 0.5f; // Time in seconds before sphere converts to earth
     
+    // Terrain resistance physics
+    float cubeMass = 100.0f; // Mass of the cube in kg
+    float cubeEnginePower = 500.0f; // Engine force in Newtons
+    float terrainResistanceCoeff = 50.0f; // Resistance coefficient (force per unit volume displaced)
+    float lastTerrainForce = 0.0f; // For display purposes
+    
     // GUI settings for cube (applied on reset)
     float guiCubeStartX = -12.0f;
     float guiCubeStartZ = 0.0f;
     float guiCubeSpeed = 3.0f;
     float guiCubeHeight = 0.0f; // Height offset for cube Y position
+    float guiEnginePower = 500.0f; // Engine power setting
+    float guiResistanceCoeff = 50.0f; // Terrain resistance coefficient
     bool showGui = true;
     int activeSlider = -1; // Track which slider is being dragged
     
@@ -768,10 +777,93 @@ int main() {
         const int collisionSteps = 1;
         physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
         
+        // Calculate terrain resistance force before moving
+        // This is done by looking ahead at what terrain we'll encounter
+        float terrainResistanceForce = 0.0f;
+        float cubeBottomY_preview = guiCubeHeight; // Bottom of cube (cubeHalfY + guiCubeHeight - cubeHalfY = guiCubeHeight)
+        
+        // Sample terrain ahead of the cube to calculate resistance
+        if (cubePosition.x >= -10.0f && cubePosition.x <= 10.0f &&
+            cubePosition.z >= -10.0f && cubePosition.z <= 10.0f) {
+            
+            float rotationRad = circleMode ? 
+                (circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f) : 
+                (guiBladeRotation * 3.14159f / 180.0f);
+            float cosR = cosf(rotationRad);
+            float sinR = sinf(rotationRad);
+            
+            // Calculate the 4 corners of the rotated cube footprint
+            float previewCorners[4][2] = {
+                { cubeHalfX * cosR - cubeHalfZ * sinR,  cubeHalfX * sinR + cubeHalfZ * cosR},
+                {-cubeHalfX * cosR - cubeHalfZ * sinR, -cubeHalfX * sinR + cubeHalfZ * cosR},
+                { cubeHalfX * cosR + cubeHalfZ * sinR,  cubeHalfX * sinR - cubeHalfZ * cosR},
+                {-cubeHalfX * cosR + cubeHalfZ * sinR, -cubeHalfX * sinR - cubeHalfZ * cosR}
+            };
+            
+            float previewMinX = previewCorners[0][0], previewMaxX = previewCorners[0][0];
+            float previewMinZ = previewCorners[0][1], previewMaxZ = previewCorners[0][1];
+            for (int i = 1; i < 4; i++) {
+                if (previewCorners[i][0] < previewMinX) previewMinX = previewCorners[i][0];
+                if (previewCorners[i][0] > previewMaxX) previewMaxX = previewCorners[i][0];
+                if (previewCorners[i][1] < previewMinZ) previewMinZ = previewCorners[i][1];
+                if (previewCorners[i][1] > previewMaxZ) previewMaxZ = previewCorners[i][1];
+            }
+            
+            int hmMinX_p = (int)((cubePosition.x + previewMinX + 10.0f) / (20.0f / heightmapSize));
+            int hmMaxX_p = (int)((cubePosition.x + previewMaxX + 10.0f) / (20.0f / heightmapSize));
+            int hmMinZ_p = (int)((cubePosition.z + previewMinZ + 10.0f) / (20.0f / heightmapSize));
+            int hmMaxZ_p = (int)((cubePosition.z + previewMaxZ + 10.0f) / (20.0f / heightmapSize));
+            
+            // Calculate total penetration depth (represents displaced volume)
+            float totalPenetration = 0.0f;
+            int cellCount = 0;
+            for (int z = hmMinZ_p; z <= hmMaxZ_p; z++) {
+                for (int x = hmMinX_p; x <= hmMaxX_p; x++) {
+                    if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
+                        float terrainHeight = heightSamples[z * heightmapSize + x];
+                        if (cubeBottomY_preview < terrainHeight) {
+                            float penetration = terrainHeight - cubeBottomY_preview;
+                            totalPenetration += penetration;
+                            cellCount++;
+                        }
+                    }
+                }
+            }
+            
+            // Calculate resistance force: F = coefficient * penetration_area * speed^2
+            // More penetration = more resistance, faster = more resistance (drag-like)
+            float cellArea = terrainScale * terrainScale;
+            float penetrationVolume = totalPenetration * cellArea;
+            // Scale up the resistance significantly - multiply by large factor to make it meaningful
+            // penetrationVolume is tiny because terrainScale is small (~0.078), so we need a big multiplier
+            terrainResistanceForce = guiResistanceCoeff * penetrationVolume * 1000.0f * (1.0f + cubeCurrentSpeed * cubeCurrentSpeed);
+        }
+        
+        lastTerrainForce = terrainResistanceForce;
+        
+        // Physics-based speed calculation
+        // Net force = Engine power - Terrain resistance
+        // Acceleration = Net force / Mass
+        float netForce = guiEnginePower - terrainResistanceForce;
+        float acceleration = netForce / cubeMass;
+        
+        // Update current speed based on acceleration
+        cubeCurrentSpeed += acceleration * deltaTime;
+        
+        // Clamp speed to reasonable bounds (can't go negative, can't exceed max)
+        float maxSpeed = guiCubeSpeed;
+        cubeCurrentSpeed = Clamp(cubeCurrentSpeed, 0.01f, maxSpeed); // Minimum speed to prevent stalling completely
+        
+        // If resistance exceeds engine power, apply stronger braking
+        if (terrainResistanceForce > guiEnginePower) {
+            float overloadRatio = terrainResistanceForce / guiEnginePower;
+            cubeCurrentSpeed *= (1.0f - 0.1f * fminf(overloadRatio - 1.0f, 5.0f) * deltaTime * 60.0f); // Scale braking with overload
+        }
+        
         // Update moving cube position based on mode
         if (circleMode) {
             // Circle mode: rotate around center point
-            float angularSpeed = cubeSpeed / guiCircleRadius; // radians per second
+            float angularSpeed = cubeCurrentSpeed / guiCircleRadius; // radians per second
             circleAngle += angularSpeed * deltaTime;
             if (circleAngle > 2.0f * 3.14159f) {
                 circleAngle -= 2.0f * 3.14159f;
@@ -786,12 +878,12 @@ int main() {
             cubeRotation = Quat::sRotation(Vec3(0, 1, 0), totalRotation);
         } else {
             // Linear mode: move left to right
-            cubePosition.x += cubeSpeed * deltaTime;
+            cubePosition.x += cubeCurrentSpeed * deltaTime;
             if (cubePosition.x > cubeMaxX) {
                 // Reset cube with GUI values
                 cubePosition.x = guiCubeStartX;
                 cubePosition.z = guiCubeStartZ;
-                cubeSpeed = guiCubeSpeed;
+                cubeCurrentSpeed = guiCubeSpeed; // Reset to base speed
                 cubeMinX = guiCubeStartX;
             }
             // Update rotation from GUI
@@ -809,11 +901,11 @@ int main() {
         // Set velocity so physics engine knows it's moving (helps with collision response)
         if (circleMode) {
             // Tangent velocity for circle motion
-            float vx = -cubeSpeed * sinf(circleAngle);
-            float vz = cubeSpeed * cosf(circleAngle);
+            float vx = -cubeCurrentSpeed * sinf(circleAngle);
+            float vz = cubeCurrentSpeed * cosf(circleAngle);
             body_interface.SetLinearVelocity(cube_body_id, Vec3(vx, 0.0f, vz));
         } else {
-            body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeSpeed, 0.0f, 0.0f));
+            body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeCurrentSpeed, 0.0f, 0.0f));
         }
         
         // Cube terrain deformation - dig into terrain and spawn spheres
@@ -1109,17 +1201,22 @@ int main() {
         DrawText("Right-click to drop 10 spheres from 5m high", 10, 10, 20, ::DARKGRAY);
         DrawText(TextFormat("Sphere Count: %d", (int)dynamicSpheres.size()), 10, 35, 16, ::DARKGRAY);
         DrawText(TextFormat("Sphere Radius: %.2fm", sphereRadius), 10, 55, 16, ::DARKGRAY);
-        DrawFPS(10, 75);
+        float speedPercent = (guiCubeSpeed > 0) ? (cubeCurrentSpeed / guiCubeSpeed * 100.0f) : 0.0f;
+        DrawText(TextFormat("Speed: %.2f / %.2f m/s (%.0f%%)", cubeCurrentSpeed, guiCubeSpeed, speedPercent), 10, 75, 16, 
+                 speedPercent < 50.0f ? ::RED : ::DARKGRAY);
+        DrawText(TextFormat("Terrain Force: %.0f N (Engine: %.0f N)", lastTerrainForce, guiEnginePower), 10, 95, 16, 
+                 lastTerrainForce > guiEnginePower ? ::RED : ::DARKGRAY);
+        DrawFPS(10, 115);
         
         // Toggle GUI with G key
         if (IsKeyPressed(KEY_G)) showGui = !showGui;
         
         // Draw GUI panel for cube settings
         if (showGui) {
-            int panelX = screenWidth - 230;
-            int panelY = 10;
+            int panelX = 10;
+            int panelY = 140;
             int panelW = 220;
-            int panelH = circleMode ? 285 : 225;
+            int panelH = circleMode ? 335 : 275;
             
             DrawRectangle(panelX, panelY, panelW, panelH, Fade(::LIGHTGRAY, 0.9f));
             DrawRectangleLines(panelX, panelY, panelW, panelH, ::DARKGRAY);
@@ -1291,6 +1388,60 @@ int main() {
                 }
                 DrawText(TextFormat("%.1f", guiCubeHeight), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
             }
+            
+            // Slider 6: Engine Power
+            {
+                int sliderX = panelX + 70;
+                int sliderY = sliderStartY + 125;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = 100.0f, maxVal = 2000.0f;
+                
+                DrawText("Engine:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiEnginePower - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::ORANGE);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 12;
+                }
+                if (activeSlider == 12 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiEnginePower = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.0fN", guiEnginePower), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
+            
+            // Slider 7: Resistance Coefficient
+            {
+                int sliderX = panelX + 70;
+                int sliderY = sliderStartY + 150;
+                int sliderW = 120;
+                int sliderH = 16;
+                float minVal = 10.0f, maxVal = 200.0f;
+                
+                DrawText("Resist:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                
+                float normalized = (guiResistanceCoeff - minVal) / (maxVal - minVal);
+                int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                DrawRectangle(handleX, sliderY, 10, sliderH, ::MAROON);
+                
+                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                    if (mousePressed) activeSlider = 13;
+                }
+                if (activeSlider == 13 && mouseDown) {
+                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                    guiResistanceCoeff = minVal + newNorm * (maxVal - minVal);
+                }
+                DrawText(TextFormat("%.0f", guiResistanceCoeff), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+            }
             } else {
                 // Circle mode sliders
                 // Center X
@@ -1454,12 +1605,66 @@ int main() {
                     }
                     DrawText(TextFormat("%.1f", guiCubeHeight), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
                 }
+                
+                // Engine Power (circle mode)
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 150;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = 100.0f, maxVal = 2000.0f;
+                    
+                    DrawText("Engine:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiEnginePower - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::ORANGE);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 14;
+                    }
+                    if (activeSlider == 14 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiEnginePower = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.0fN", guiEnginePower), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
+                
+                // Resistance Coefficient (circle mode)
+                {
+                    int sliderX = panelX + 70;
+                    int sliderY = sliderStartY + 175;
+                    int sliderW = 120;
+                    int sliderH = 16;
+                    float minVal = 10.0f, maxVal = 200.0f;
+                    
+                    DrawText("Resist:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
+                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
+                    
+                    float normalized = (guiResistanceCoeff - minVal) / (maxVal - minVal);
+                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
+                    DrawRectangle(handleX, sliderY, 10, sliderH, ::MAROON);
+                    
+                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
+                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
+                        if (mousePressed) activeSlider = 15;
+                    }
+                    if (activeSlider == 15 && mouseDown) {
+                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
+                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
+                        guiResistanceCoeff = minVal + newNorm * (maxVal - minVal);
+                    }
+                    DrawText(TextFormat("%.0f", guiResistanceCoeff), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
+                }
             }
             
             if (mouseReleased) activeSlider = -1;
             
             // Current position display
-            int footerY = circleMode ? panelY + 220 : panelY + 160;
+            int footerY = circleMode ? panelY + 270 : panelY + 210;
             DrawText(TextFormat("Current: (%.1f, %.1f, %.1f)", cubePosition.x, cubePosition.y, cubePosition.z), 
                      panelX + 5, footerY, 10, ::BLUE);
             

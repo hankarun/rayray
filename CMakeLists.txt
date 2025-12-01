@@ -43,3 +43,8 @@ FetchContent_MakeAvailable(raylib JoltPhysics)
 add_executable(hello_world main.cpp)
 
 target_link_libraries(hello_world raylib Jolt)
+
+# Set working directory to source directory for debugging
+set_target_properties(hello_world PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
