@@ -1060,6 +1060,19 @@ int main() {
             for (int z = hmMinZ_p; z <= hmMaxZ_p; z++) {
                 for (int x = hmMinX_p; x <= hmMaxX_p; x++) {
                     if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
+                        // Convert heightmap cell back to world coordinates
+                        float cellWorldX = (float)x * (20.0f / heightmapSize) - 10.0f;
+                        float cellWorldZ = (float)z * (20.0f / heightmapSize) - 10.0f;
+                        
+                        // Transform cell position to cube's local space (rotate by -rotationRad)
+                        float localX = (cellWorldX - cubePosition.x) * cosR + (cellWorldZ - cubePosition.z) * sinR;
+                        float localZ = -(cellWorldX - cubePosition.x) * sinR + (cellWorldZ - cubePosition.z) * cosR;
+                        
+                        // Check if point is inside the cube's footprint (in local space, it's axis-aligned)
+                        if (fabsf(localX) > cubeHalfX || fabsf(localZ) > cubeHalfZ) {
+                            continue; // Point is outside the rotated cube footprint
+                        }
+                        
                         float terrainHeight = heightSamples[z * heightmapSize + x];
                         if (cubeBottomY_preview < terrainHeight) {
                             float penetration = terrainHeight - cubeBottomY_preview;
@@ -1192,6 +1205,19 @@ int main() {
             for (int z = hmMinZ; z <= hmMaxZ; z++) {
                 for (int x = hmMinX; x <= hmMaxX; x++) {
                     if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
+                        // Convert heightmap cell back to world coordinates
+                        float cellWorldX = (float)x * (20.0f / heightmapSize) - 10.0f;
+                        float cellWorldZ = (float)z * (20.0f / heightmapSize) - 10.0f;
+                        
+                        // Transform cell position to cube's local space (rotate by -rotationRad)
+                        float localX = (cellWorldX - cubePosition.x) * cosR + (cellWorldZ - cubePosition.z) * sinR;
+                        float localZ = (cellWorldX - cubePosition.x) * sinR + (cellWorldZ - cubePosition.z) * cosR;
+                        
+                        // Check if point is inside the cube's footprint (in local space, it's axis-aligned)
+                        if (fabsf(localX) > cubeHalfX || fabsf(localZ) > cubeHalfZ) {
+                            continue; // Point is outside the rotated cube footprint
+                        }
+                        
                         int idx = z * heightmapSize + x;
                         float currentHeight = heightSamples[idx];
                         
