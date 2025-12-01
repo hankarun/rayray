@@ -457,6 +457,7 @@ int main() {
     const int screenWidth = 800;
     const int screenHeight = 450;
 
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(screenWidth, screenHeight, "Jolt Physics with Heightmap - raylib");
 
     // Initialize Jolt Physics
