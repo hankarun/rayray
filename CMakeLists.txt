@@ -40,7 +40,21 @@ set(USE_MSVC_RUNTIME_LIBRARY_DLL OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(raylib JoltPhysics)
 
-add_executable(hello_world main.cpp)
+# Include directories
+include_directories(include)
+
+# Source files
+set(SOURCES
+    main.cpp
+    src/PhysicsLayers.cpp
+    src/PhysicsStructures.cpp
+    src/DensityAutomata.cpp
+    src/ParticleVoxelGrid.cpp
+    src/PerlinNoise.cpp
+    src/Helpers.cpp
+)
+
+add_executable(hello_world ${SOURCES})
 
 target_link_libraries(hello_world raylib Jolt)
 
