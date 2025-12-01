@@ -131,6 +131,8 @@ struct PhysicsSphere
     float stoppedTimer; // Timer to track how long the sphere has been stopped
     bool markedForDestruction;
     Vector3 lastPosition; // Track position for velocity check
+    Vector3 velocity;     // Current velocity of the sphere
+    float mass;           // Mass of the sphere
 };
 
 // Helper to check if a sphere has stopped moving
@@ -248,6 +250,225 @@ public:
     }
     
     int GetGridSize() const { return gridSize; }
+};
+
+// Voxel cell for particle tracking
+struct ParticleVoxelCell
+{
+    float totalMass;           // Total mass of particles in this cell
+    Vector3 averageVelocity;   // Average velocity of particles
+    int particleCount;         // Number of particles in this cell
+    float momentum;            // Magnitude of momentum (for force calculation)
+};
+
+// 3D Voxel grid for tracking moving particles
+class ParticleVoxelGrid
+{
+private:
+    std::vector<ParticleVoxelCell> cells;
+    int gridSizeX, gridSizeY, gridSizeZ;
+    float cellSize;
+    float worldMinX, worldMinY, worldMinZ;
+    float worldMaxX, worldMaxY, worldMaxZ;
+    
+public:
+    ParticleVoxelGrid(int sizeX, int sizeY, int sizeZ, float cellSz, 
+                      float minX, float minY, float minZ,
+                      float maxX, float maxY, float maxZ)
+        : gridSizeX(sizeX), gridSizeY(sizeY), gridSizeZ(sizeZ), cellSize(cellSz),
+          worldMinX(minX), worldMinY(minY), worldMinZ(minZ),
+          worldMaxX(maxX), worldMaxY(maxY), worldMaxZ(maxZ)
+    {
+        cells.resize(sizeX * sizeY * sizeZ);
+        Clear();
+    }
+    
+    void Clear() {
+        for (auto& cell : cells) {
+            cell.totalMass = 0.0f;
+            cell.averageVelocity = { 0.0f, 0.0f, 0.0f };
+            cell.particleCount = 0;
+            cell.momentum = 0.0f;
+        }
+    }
+    
+    int GetIndex(int x, int y, int z) const {
+        if (x < 0 || x >= gridSizeX || y < 0 || y >= gridSizeY || z < 0 || z >= gridSizeZ)
+            return -1;
+        return z * gridSizeX * gridSizeY + y * gridSizeX + x;
+    }
+    
+    void WorldToGrid(float wx, float wy, float wz, int& gx, int& gy, int& gz) const {
+        gx = (int)((wx - worldMinX) / cellSize);
+        gy = (int)((wy - worldMinY) / cellSize);
+        gz = (int)((wz - worldMinZ) / cellSize);
+        gx = Clamp(gx, 0, gridSizeX - 1);
+        gy = Clamp(gy, 0, gridSizeY - 1);
+        gz = Clamp(gz, 0, gridSizeZ - 1);
+    }
+    
+    void AddParticle(float wx, float wy, float wz, float mass, Vector3 velocity) {
+        int gx, gy, gz;
+        WorldToGrid(wx, wy, wz, gx, gy, gz);
+        int idx = GetIndex(gx, gy, gz);
+        if (idx >= 0) {
+            ParticleVoxelCell& cell = cells[idx];
+            // Accumulate velocity weighted by mass for later averaging
+            float oldTotalMass = cell.totalMass;
+            cell.totalMass += mass;
+            if (cell.totalMass > 0.0f) {
+                // Weighted average of velocities
+                cell.averageVelocity.x = (cell.averageVelocity.x * oldTotalMass + velocity.x * mass) / cell.totalMass;
+                cell.averageVelocity.y = (cell.averageVelocity.y * oldTotalMass + velocity.y * mass) / cell.totalMass;
+                cell.averageVelocity.z = (cell.averageVelocity.z * oldTotalMass + velocity.z * mass) / cell.totalMass;
+            }
+            cell.particleCount++;
+            // Calculate momentum magnitude
+            float velMag = sqrtf(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
+            cell.momentum += mass * velMag;
+        }
+    }
+    
+    // Calculate force from particles against a blade (represented as a rotated box)
+    // Returns force vector that particles exert on the blade
+    Vector3 CalculateBladeForce(Vector3 bladePos, float bladeHalfX, float bladeHalfY, float bladeHalfZ,
+                                float bladeRotationRad, float deltaTime) const {
+        Vector3 totalForce = { 0.0f, 0.0f, 0.0f };
+        
+        float cosR = cosf(bladeRotationRad);
+        float sinR = sinf(bladeRotationRad);
+        
+        // Calculate blade AABB for quick rejection
+        float bladeExtentX = fabs(bladeHalfX * cosR) + fabs(bladeHalfZ * sinR);
+        float bladeExtentZ = fabs(bladeHalfX * sinR) + fabs(bladeHalfZ * cosR);
+        
+        float bladeMinX = bladePos.x - bladeExtentX;
+        float bladeMaxX = bladePos.x + bladeExtentX;
+        float bladeMinY = bladePos.y - bladeHalfY;
+        float bladeMaxY = bladePos.y + bladeHalfY;
+        float bladeMinZ = bladePos.z - bladeExtentZ;
+        float bladeMaxZ = bladePos.z + bladeExtentZ;
+        
+        // Convert blade bounds to grid coordinates
+        int gridMinX, gridMinY, gridMinZ, gridMaxX, gridMaxY, gridMaxZ;
+        WorldToGrid(bladeMinX, bladeMinY, bladeMinZ, gridMinX, gridMinY, gridMinZ);
+        WorldToGrid(bladeMaxX, bladeMaxY, bladeMaxZ, gridMaxX, gridMaxY, gridMaxZ);
+        
+        // Blade normal direction (perpendicular to blade face, in direction of travel)
+        // For a blade moving in +X direction with rotation, the front face normal
+        Vector3 bladeNormal = { cosR, 0.0f, sinR };
+        
+        // Check all voxel cells that might intersect the blade
+        for (int gz = gridMinZ; gz <= gridMaxZ; gz++) {
+            for (int gy = gridMinY; gy <= gridMaxY; gy++) {
+                for (int gx = gridMinX; gx <= gridMaxX; gx++) {
+                    int idx = GetIndex(gx, gy, gz);
+                    if (idx < 0) continue;
+                    
+                    const ParticleVoxelCell& cell = cells[idx];
+                    if (cell.particleCount == 0 || cell.totalMass < 0.001f) continue;
+                    
+                    // Calculate cell center in world space
+                    float cellCenterX = worldMinX + (gx + 0.5f) * cellSize;
+                    float cellCenterY = worldMinY + (gy + 0.5f) * cellSize;
+                    float cellCenterZ = worldMinZ + (gz + 0.5f) * cellSize;
+                    
+                    // Transform cell center to blade local space
+                    float localX = (cellCenterX - bladePos.x) * cosR + (cellCenterZ - bladePos.z) * sinR;
+                    float localZ = -(cellCenterX - bladePos.x) * sinR + (cellCenterZ - bladePos.z) * cosR;
+                    float localY = cellCenterY - bladePos.y;
+                    
+                    // Check if cell is inside blade bounds (in local space)
+                    if (fabs(localX) <= bladeHalfX + cellSize * 0.5f &&
+                        fabs(localY) <= bladeHalfY + cellSize * 0.5f &&
+                        fabs(localZ) <= bladeHalfZ + cellSize * 0.5f) {
+                        
+                        // Calculate relative velocity (particle velocity relative to blade)
+                        // Particles hitting the front of the blade exert force
+                        Vector3 relVel = cell.averageVelocity;
+                        
+                        // Force = dp/dt = m * dv/dt ≈ m * v / dt (impulse force)
+                        // We use momentum change as force estimate
+                        // F = mass * velocity_component_normal_to_blade / deltaTime
+                        
+                        float velDotNormal = relVel.x * bladeNormal.x + relVel.y * bladeNormal.y + relVel.z * bladeNormal.z;
+                        
+                        // Only count particles moving against the blade (negative dot product means towards blade)
+                        // Actually, we want particles that the blade is pushing - so blade velocity vs particle
+                        // For simplicity, use momentum magnitude scaled by contact
+                        float forceMagnitude = cell.momentum / fmaxf(deltaTime, 0.001f);
+                        
+                        // Apply force in direction opposite to blade normal (reaction force)
+                        totalForce.x -= bladeNormal.x * forceMagnitude * 0.01f; // Scale factor for reasonable force
+                        totalForce.y -= bladeNormal.y * forceMagnitude * 0.01f;
+                        totalForce.z -= bladeNormal.z * forceMagnitude * 0.01f;
+                    }
+                }
+            }
+        }
+        
+        return totalForce;
+    }
+    
+    // Get statistics for display
+    int GetTotalParticleCount() const {
+        int total = 0;
+        for (const auto& cell : cells) {
+            total += cell.particleCount;
+        }
+        return total;
+    }
+    
+    float GetTotalMomentum() const {
+        float total = 0.0f;
+        for (const auto& cell : cells) {
+            total += cell.momentum;
+        }
+        return total;
+    }
+    
+    int GetGridSizeX() const { return gridSizeX; }
+    int GetGridSizeY() const { return gridSizeY; }
+    int GetGridSizeZ() const { return gridSizeZ; }
+    float GetCellSize() const { return cellSize; }
+    float GetWorldMinX() const { return worldMinX; }
+    float GetWorldMinY() const { return worldMinY; }
+    float GetWorldMinZ() const { return worldMinZ; }
+    
+    // Draw debug visualization of occupied voxels
+    void DrawDebug() const {
+        for (int gz = 0; gz < gridSizeZ; gz++) {
+            for (int gy = 0; gy < gridSizeY; gy++) {
+                for (int gx = 0; gx < gridSizeX; gx++) {
+                    int idx = GetIndex(gx, gy, gz);
+                    if (idx >= 0 && cells[idx].particleCount > 0) {
+                        // Calculate world position of voxel center
+                        float wx = worldMinX + (gx + 0.5f) * cellSize;
+                        float wy = worldMinY + (gy + 0.5f) * cellSize;
+                        float wz = worldMinZ + (gz + 0.5f) * cellSize;
+                        
+                        // Color based on momentum/mass
+                        float intensity = fminf(cells[idx].momentum / 0.5f, 1.0f);
+                        ::Color voxelColor = {
+                            (unsigned char)(255 * intensity),
+                            (unsigned char)(100 * (1.0f - intensity)),
+                            (unsigned char)(50),
+                            (unsigned char)(150)
+                        };
+                        
+                        // Draw wireframe cube for each occupied voxel
+                        DrawCubeWires(Vector3{wx, wy, wz}, cellSize * 0.9f, cellSize * 0.9f, cellSize * 0.9f, voxelColor);
+                        
+                        // Draw solid cube with transparency for high-momentum cells
+                        if (cells[idx].momentum > 0.1f) {
+                            DrawCube(Vector3{wx, wy, wz}, cellSize * 0.8f, cellSize * 0.8f, cellSize * 0.8f, 
+                                    Fade(voxelColor, 0.3f));
+                        }
+                    }
+                }
+            }
+        }
+    }
 };
 
 // Perlin noise implementation
@@ -584,6 +805,18 @@ int main() {
     // Initialize density cellular automata
     DensityAutomata densityGrid(heightmapSize, terrainScale);
     
+    // Initialize particle voxel grid for force calculations
+    // Grid covers -15 to 15 in X and Z, 0 to 5 in Y (where particles are active)
+    int voxelGridSizeXZ = 60;  // 30m / 0.5m cell size
+    int voxelGridSizeY = 10;   // 5m / 0.5m cell size
+    float voxelCellSize = 0.5f;
+    ParticleVoxelGrid particleVoxelGrid(voxelGridSizeXZ, voxelGridSizeY, voxelGridSizeXZ,
+                                         voxelCellSize,
+                                         -15.0f, 0.0f, -15.0f,   // min bounds
+                                         15.0f, 5.0f, 15.0f);    // max bounds
+    float lastParticleForce = 0.0f;  // For display purposes
+    Vector3 lastParticleForceVec = { 0.0f, 0.0f, 0.0f }; // Force vector from particles
+    
     HeightFieldShapeSettings heightfield_settings(heightSamples.data(), Vec3(0, 0, 0), 
         Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
     ShapeSettings::ShapeResult heightfield_shape_result = heightfield_settings.Create();
@@ -609,6 +842,9 @@ int main() {
     
     // Create a sphere model for rendering
     float sphereRadius = 0.1f;
+    float sphereDensity = 1500.0f; // kg/m³ (dirt/soil density)
+    float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
+    float sphereMass = sphereDensity * sphereVolume; // Mass of each sphere
     Model sphereModel = LoadModelFromMesh(GenMeshSphere(sphereRadius, 32, 32));
     sphereModel.materials[0].shader = shader;
     
@@ -674,6 +910,9 @@ int main() {
     float guiCircleRadius = 5.0f;
     float guiBladeRotation = 45.0f; // Rotation angle in degrees
     float circleAngle = 0.0f; // Current angle for circle movement
+    
+    // Debug visualization settings
+    bool showVoxelDebug = false; // Toggle for voxel debug visualization
 
     // List to hold dynamic spheres
     std::vector<PhysicsSphere> dynamicSpheres;
@@ -768,7 +1007,8 @@ int main() {
                     255
                 };
                 
-                dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, spawnPosition});
+                Vector3 initialVelocity = { 0.0f, 0.0f, 0.0f };
+                dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, spawnPosition, initialVelocity, sphereMass});
             }
         }
 
@@ -1024,7 +1264,8 @@ int main() {
                         255
                     }; // Brown dirt color
                     
-                    dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, sphereSpawnPos});
+                    Vector3 initialVelocity = { 0.0f, 0.0f, 0.0f };
+                    dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, sphereSpawnPos, initialVelocity, sphereMass});
                 }
             }
         }
@@ -1057,14 +1298,24 @@ int main() {
         // Check for spheres touching terrain and track stopped time
         bool densityAdded = false;
         
+        // Clear particle voxel grid for fresh update
+        particleVoxelGrid.Clear();
+        
         for (auto& sphere : dynamicSpheres) {
             if (sphere.markedForDestruction) continue;
             
             RVec3 position = body_interface.GetPosition(sphere.bodyID);
+            Vec3 joltVel = body_interface.GetLinearVelocity(sphere.bodyID);
             float worldX = (float)position.GetX();
             float worldY = (float)position.GetY();
             float worldZ = (float)position.GetZ();
             Vector3 currentPos = { worldX, worldY, worldZ };
+            
+            // Update sphere velocity from physics engine
+            sphere.velocity = { joltVel.GetX(), joltVel.GetY(), joltVel.GetZ() };
+            
+            // Add this sphere to the particle voxel grid
+            particleVoxelGrid.AddParticle(worldX, worldY, worldZ, sphere.mass, sphere.velocity);
             
             // Check if sphere is touching or near the ground
             float terrainHeight = 0.0f;
@@ -1108,6 +1359,26 @@ int main() {
                 worldZ < -15.0f || worldZ > 15.0f) {
                 sphere.markedForDestruction = true;
             }
+        }
+        
+        // Calculate particle forces against the blade using voxel grid
+        {
+            float rotationRad = circleMode ? 
+                (circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f) : 
+                (guiBladeRotation * 3.14159f / 180.0f);
+            
+            lastParticleForceVec = particleVoxelGrid.CalculateBladeForce(
+                cubePosition, cubeHalfX, cubeHalfY, cubeHalfZ,
+                rotationRad, deltaTime);
+            
+            // Calculate magnitude of particle force
+            lastParticleForce = sqrtf(lastParticleForceVec.x * lastParticleForceVec.x + 
+                                      lastParticleForceVec.y * lastParticleForceVec.y + 
+                                      lastParticleForceVec.z * lastParticleForceVec.z);
+            
+            // Add particle force to terrain resistance for speed calculation
+            // This makes pushing particles slow down the blade
+            terrainResistanceForce += lastParticleForce;
         }
         
         // Recreate physics body periodically to match CA updates (every few frames)
@@ -1196,6 +1467,11 @@ int main() {
             (circleAngle * 180.0f / 3.14159f + 90.0f + guiBladeRotation) : guiBladeRotation;
         DrawModelEx(cubeModel, cubePosition, Vector3{0.0f, 1.0f, 0.0f}, visualRotation, Vector3{1.0f, 1.0f, 1.0f}, ::BLUE);
         
+        // Draw voxel debug visualization
+        if (showVoxelDebug) {
+            particleVoxelGrid.DrawDebug();
+        }
+        
         EndMode3D();
 
         DrawText("Right-click to drop 10 spheres from 5m high", 10, 10, 20, ::DARKGRAY);
@@ -1204,17 +1480,21 @@ int main() {
         float speedPercent = (guiCubeSpeed > 0) ? (cubeCurrentSpeed / guiCubeSpeed * 100.0f) : 0.0f;
         DrawText(TextFormat("Speed: %.2f / %.2f m/s (%.0f%%)", cubeCurrentSpeed, guiCubeSpeed, speedPercent), 10, 75, 16, 
                  speedPercent < 50.0f ? ::RED : ::DARKGRAY);
-        DrawText(TextFormat("Terrain Force: %.0f N (Engine: %.0f N)", lastTerrainForce, guiEnginePower), 10, 95, 16, 
-                 lastTerrainForce > guiEnginePower ? ::RED : ::DARKGRAY);
-        DrawFPS(10, 115);
+        float totalForce = lastTerrainForce + lastParticleForce;
+        DrawText(TextFormat("Total Force: %.0f N (Terrain: %.0f + Particle: %.0f)", totalForce, lastTerrainForce, lastParticleForce), 
+                 10, 95, 16, totalForce > guiEnginePower ? ::RED : ::DARKGRAY);
+        DrawText(TextFormat("Engine: %.0f N | Voxels: %d", guiEnginePower, particleVoxelGrid.GetTotalParticleCount()), 
+                 10, 115, 16, ::DARKGRAY);
+        DrawFPS(10, 135);
         
-        // Toggle GUI with G key
+        // Toggle GUI with G key, toggle voxel debug with V key
         if (IsKeyPressed(KEY_G)) showGui = !showGui;
+        if (IsKeyPressed(KEY_V)) showVoxelDebug = !showVoxelDebug;
         
         // Draw GUI panel for cube settings
         if (showGui) {
             int panelX = 10;
-            int panelY = 140;
+            int panelY = 160;
             int panelW = 220;
             int panelH = circleMode ? 335 : 275;
             
@@ -1669,7 +1949,9 @@ int main() {
                      panelX + 5, footerY, 10, ::BLUE);
             
             DrawText("Press G to toggle GUI", panelX + 5, footerY + 20, 10, ::GRAY);
-            DrawText(circleMode ? "Circle mode active" : "Linear mode (resets at edge)", panelX + 5, footerY + 33, 10, ::GRAY);
+            DrawText(TextFormat("Press V to toggle voxels %s", showVoxelDebug ? "(ON)" : "(OFF)"), panelX + 5, footerY + 33, 10, 
+                     showVoxelDebug ? ::GREEN : ::GRAY);
+            DrawText(circleMode ? "Circle mode active" : "Linear mode (resets at edge)", panelX + 5, footerY + 46, 10, ::GRAY);
         }
 
         EndDrawing();
