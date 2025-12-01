@@ -911,6 +911,15 @@ int main() {
     float guiBladeRotation = 45.0f; // Rotation angle in degrees
     float circleAngle = 0.0f; // Current angle for circle movement
     
+    // Manual drive mode settings
+    bool manualMode = false; // Manual arrow key control mode
+    int driveMode = 0; // 0 = linear, 1 = circle, 2 = manual
+    float manualRotation = 0.0f; // Current rotation in manual mode (radians)
+    Vector3 manualVelocity = { 0.0f, 0.0f, 0.0f }; // Current velocity in manual mode
+    float manualAcceleration = 10.0f; // Acceleration when pressing arrow keys
+    float manualDeceleration = 5.0f; // Deceleration when not pressing keys
+    float manualTurnSpeed = 2.0f; // Rotation speed in radians per second
+    
     // Debug visualization settings
     bool showVoxelDebug = false; // Toggle for voxel debug visualization
 
@@ -1026,9 +1035,14 @@ int main() {
         if (cubePosition.x >= -10.0f && cubePosition.x <= 10.0f &&
             cubePosition.z >= -10.0f && cubePosition.z <= 10.0f) {
             
-            float rotationRad = circleMode ? 
-                (circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f) : 
-                (guiBladeRotation * 3.14159f / 180.0f);
+            float rotationRad;
+            if (driveMode == 2) {
+                rotationRad = manualRotation + guiBladeRotation * 3.14159f / 180.0f;
+            } else if (driveMode == 1) {
+                rotationRad = circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f;
+            } else {
+                rotationRad = guiBladeRotation * 3.14159f / 180.0f;
+            }
             float cosR = cosf(rotationRad);
             float sinR = sinf(rotationRad);
             
@@ -1114,7 +1128,74 @@ int main() {
         }
         
         // Update moving cube position based on mode
-        if (circleMode) {
+        if (driveMode == 2) {
+            // Manual mode: arrow key control
+            // Rotation with left/right arrows
+            if (IsKeyDown(KEY_LEFT)) {
+                manualRotation += manualTurnSpeed * deltaTime;
+            }
+            if (IsKeyDown(KEY_RIGHT)) {
+                manualRotation -= manualTurnSpeed * deltaTime;
+            }
+            
+            // Forward/backward acceleration with up/down arrows
+            float forwardInput = 0.0f;
+            if (IsKeyDown(KEY_UP)) {
+                forwardInput = 1.0f;
+            }
+            if (IsKeyDown(KEY_DOWN)) {
+                forwardInput = -0.5f; // Slower reverse
+            }
+            
+            // Calculate forward direction based on rotation
+            float forwardX = cosf(manualRotation);
+            float forwardZ = -sinf(manualRotation);
+            
+            if (forwardInput != 0.0f) {
+                // Accelerate in the forward direction
+                manualVelocity.x += forwardX * forwardInput * manualAcceleration * deltaTime;
+                manualVelocity.z += forwardZ * forwardInput * manualAcceleration * deltaTime;
+            } else {
+                // Decelerate when no input
+                float speed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
+                if (speed > 0.01f) {
+                    float decel = manualDeceleration * deltaTime;
+                    float newSpeed = fmaxf(0.0f, speed - decel);
+                    manualVelocity.x *= newSpeed / speed;
+                    manualVelocity.z *= newSpeed / speed;
+                } else {
+                    manualVelocity.x = 0.0f;
+                    manualVelocity.z = 0.0f;
+                }
+            }
+            
+            // Apply terrain resistance to manual velocity
+            float manualSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
+            if (manualSpeed > 0.01f && terrainResistanceForce > 0.0f) {
+                float resistanceDecel = (terrainResistanceForce / cubeMass) * deltaTime;
+                float newSpeed = fmaxf(0.0f, manualSpeed - resistanceDecel);
+                manualVelocity.x *= newSpeed / manualSpeed;
+                manualVelocity.z *= newSpeed / manualSpeed;
+            }
+            
+            // Clamp max speed
+            float maxManualSpeed = guiCubeSpeed;
+            manualSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
+            if (manualSpeed > maxManualSpeed) {
+                manualVelocity.x *= maxManualSpeed / manualSpeed;
+                manualVelocity.z *= maxManualSpeed / manualSpeed;
+            }
+            
+            // Update position
+            cubePosition.x += manualVelocity.x * deltaTime;
+            cubePosition.z += manualVelocity.z * deltaTime;
+            
+            // Update current speed for display
+            cubeCurrentSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
+            
+            // Update rotation
+            cubeRotation = Quat::sRotation(Vec3(0, 1, 0), manualRotation + guiBladeRotation * 3.14159f / 180.0f);
+        } else if (driveMode == 1) {
             // Circle mode: rotate around center point
             float angularSpeed = cubeCurrentSpeed / guiCircleRadius; // radians per second
             circleAngle += angularSpeed * deltaTime;
@@ -1152,7 +1233,10 @@ int main() {
             cubeRotation, 
             EActivation::Activate);
         // Set velocity so physics engine knows it's moving (helps with collision response)
-        if (circleMode) {
+        if (driveMode == 2) {
+            // Manual mode velocity
+            body_interface.SetLinearVelocity(cube_body_id, Vec3(manualVelocity.x, 0.0f, manualVelocity.z));
+        } else if (driveMode == 1) {
             // Tangent velocity for circle motion
             float vx = -cubeCurrentSpeed * sinf(circleAngle);
             float vz = cubeCurrentSpeed * cosf(circleAngle);
@@ -1169,9 +1253,14 @@ int main() {
             cubeBottomY < heightScale) { // Only dig if cube bottom is below max terrain height
             
             // Calculate rotated cube footprint - account for blade rotation
-            float rotationRad = circleMode ? 
-                (circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f) : 
-                (guiBladeRotation * 3.14159f / 180.0f);
+            float rotationRad;
+            if (driveMode == 2) {
+                rotationRad = manualRotation + guiBladeRotation * 3.14159f / 180.0f;
+            } else if (driveMode == 1) {
+                rotationRad = circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f;
+            } else {
+                rotationRad = guiBladeRotation * 3.14159f / 180.0f;
+            }
             float cosR = cosf(rotationRad);
             float sinR = sinf(rotationRad);
             
@@ -1389,9 +1478,14 @@ int main() {
         
         // Calculate particle forces against the blade using voxel grid
         {
-            float rotationRad = circleMode ? 
-                (circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f) : 
-                (guiBladeRotation * 3.14159f / 180.0f);
+            float rotationRad;
+            if (driveMode == 2) {
+                rotationRad = manualRotation + guiBladeRotation * 3.14159f / 180.0f;
+            } else if (driveMode == 1) {
+                rotationRad = circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f;
+            } else {
+                rotationRad = guiBladeRotation * 3.14159f / 180.0f;
+            }
             
             lastParticleForceVec = particleVoxelGrid.CalculateBladeForce(
                 cubePosition, cubeHalfX, cubeHalfY, cubeHalfZ,
@@ -1489,8 +1583,14 @@ int main() {
         }
         
         // Draw the moving cube with rotation from GUI
-        float visualRotation = circleMode ? 
-            (circleAngle * 180.0f / 3.14159f + 90.0f + guiBladeRotation) : guiBladeRotation;
+        float visualRotation;
+        if (driveMode == 2) {
+            visualRotation = manualRotation * 180.0f / 3.14159f + guiBladeRotation;
+        } else if (driveMode == 1) {
+            visualRotation = circleAngle * 180.0f / 3.14159f + 90.0f + guiBladeRotation;
+        } else {
+            visualRotation = guiBladeRotation;
+        }
         DrawModelEx(cubeModel, cubePosition, Vector3{0.0f, 1.0f, 0.0f}, visualRotation, Vector3{1.0f, 1.0f, 1.0f}, ::BLUE);
         
         // Draw voxel debug visualization
@@ -1522,7 +1622,7 @@ int main() {
             int panelX = 10;
             int panelY = 160;
             int panelW = 220;
-            int panelH = circleMode ? 335 : 275;
+            int panelH = (driveMode == 1) ? 335 : ((driveMode == 2) ? 200 : 275);
             
             DrawRectangle(panelX, panelY, panelW, panelH, Fade(::LIGHTGRAY, 0.9f));
             DrawRectangleLines(panelX, panelY, panelW, panelH, ::DARKGRAY);
@@ -1541,24 +1641,30 @@ int main() {
                 int btnH = 18;
                 Rectangle btnRect = { (float)btnX, (float)btnY, (float)btnW, (float)btnH };
                 
-                DrawRectangle(btnX, btnY, btnW, btnH, circleMode ? ::GREEN : ::MAROON);
+                ::Color btnColor = (driveMode == 0) ? ::MAROON : ((driveMode == 1) ? ::GREEN : ::ORANGE);
+                const char* modeText = (driveMode == 0) ? "Linear" : ((driveMode == 1) ? "Circle" : "Manual");
+                DrawRectangle(btnX, btnY, btnW, btnH, btnColor);
                 DrawRectangleLines(btnX, btnY, btnW, btnH, ::DARKGRAY);
-                DrawText(circleMode ? "Circle Mode" : "Linear Mode", btnX + 10, btnY + 4, 10, ::WHITE);
+                DrawText(modeText, btnX + 25, btnY + 4, 10, ::WHITE);
                 
                 if (CheckCollisionPointRec(mousePos, btnRect) && mousePressed) {
-                    circleMode = !circleMode;
-                    if (circleMode) {
+                    driveMode = (driveMode + 1) % 3; // Cycle through 0, 1, 2
+                    if (driveMode == 1) {
                         // Initialize circle position
                         circleAngle = 0.0f;
                         cubePosition.x = guiCircleCenterX + guiCircleRadius;
                         cubePosition.z = guiCircleCenterZ;
+                    } else if (driveMode == 2) {
+                        // Initialize manual mode
+                        manualVelocity = { 0.0f, 0.0f, 0.0f };
+                        manualRotation = 0.0f;
                     }
                 }
             }
             
             int sliderStartY = panelY + 45;
             
-            if (!circleMode) {
+            if (driveMode == 0) {
                 // Linear mode sliders
                 // Slider 1: Start X
             {
@@ -1748,7 +1854,7 @@ int main() {
                 }
                 DrawText(TextFormat("%.0f", guiResistanceCoeff), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
             }
-            } else {
+            } else if (driveMode == 1) {
                 // Circle mode sliders
                 // Center X
                 {
@@ -1965,19 +2071,33 @@ int main() {
                     }
                     DrawText(TextFormat("%.0f", guiResistanceCoeff), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
                 }
+            } else {
+                // Manual mode - show controls info
+                DrawText("Arrow Keys:", panelX + 5, sliderStartY, 10, ::DARKGRAY);
+                DrawText("UP = Forward", panelX + 10, sliderStartY + 15, 10, ::ORANGE);
+                DrawText("DOWN = Reverse", panelX + 10, sliderStartY + 30, 10, ::ORANGE);
+                DrawText("LEFT = Turn Left", panelX + 10, sliderStartY + 45, 10, ::ORANGE);
+                DrawText("RIGHT = Turn Right", panelX + 10, sliderStartY + 60, 10, ::ORANGE);
+                
+                // Speed display (current)
+                float manualSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
+                DrawText(TextFormat("Speed: %.2f m/s", manualSpeed), panelX + 5, sliderStartY + 80, 10, 
+                         manualSpeed > 0.1f ? ::BLUE : ::GRAY);
             }
             
             if (mouseReleased) activeSlider = -1;
             
             // Current position display
-            int footerY = circleMode ? panelY + 270 : panelY + 210;
+            int footerY = (driveMode == 1) ? panelY + 270 : ((driveMode == 2) ? panelY + 135 : panelY + 210);
             DrawText(TextFormat("Current: (%.1f, %.1f, %.1f)", cubePosition.x, cubePosition.y, cubePosition.z), 
                      panelX + 5, footerY, 10, ::BLUE);
             
             DrawText("Press G to toggle GUI", panelX + 5, footerY + 20, 10, ::GRAY);
             DrawText(TextFormat("Press V to toggle voxels %s", showVoxelDebug ? "(ON)" : "(OFF)"), panelX + 5, footerY + 33, 10, 
                      showVoxelDebug ? ::GREEN : ::GRAY);
-            DrawText(circleMode ? "Circle mode active" : "Linear mode (resets at edge)", panelX + 5, footerY + 46, 10, ::GRAY);
+            const char* modeInfo = (driveMode == 0) ? "Linear mode (resets at edge)" : 
+                                   ((driveMode == 1) ? "Circle mode active" : "Manual: Arrows to drive");
+            DrawText(modeInfo, panelX + 5, footerY + 46, 10, ::GRAY);
         }
 
         EndDrawing();
