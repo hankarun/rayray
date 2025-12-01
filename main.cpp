@@ -644,6 +644,7 @@ int main() {
             int hmMaxZ = (int)((cubePosition.z + maxZ + 10.0f) / (20.0f / heightmapSize));
             
             float totalDisplacedVolume = 0.0f;
+            std::vector<Vector3> dugTerrainPositions; // Store positions where digging occurred
             
             // Dig terrain under the cube - only if cube bottom is below terrain height at that point
             for (int z = hmMinZ; z <= hmMaxZ; z++) {
@@ -671,8 +672,14 @@ int main() {
                             float actualDig = fminf(digAmount, currentHeight - cubeBottomY);
                             actualDig = fminf(actualDig, currentHeight); // Don't go below 0
                             if (actualDig > 0.0f) {
+                                // Store height before modification for accurate position
+                                float heightBeforeDig = currentHeight;
+                                
                                 heightSamples[idx] -= actualDig;
                                 if (heightSamples[idx] < 0.0f) heightSamples[idx] = 0.0f;
+                                
+                                // Store the terrain position where digging occurred (use height before dig)
+                                dugTerrainPositions.push_back({cellWorldX, heightBeforeDig, cellWorldZ});
                                 
                                 // Calculate displaced volume (per cell)
                                 float cellArea = terrainScale * terrainScale;
@@ -691,17 +698,31 @@ int main() {
             while (sphereSpawnAccumulator >= sphereVolume && (int)dynamicSpheres.size() < maxSphereCount) {
                 sphereSpawnAccumulator -= sphereVolume;
                 
-                // Spawn sphere IN FRONT of the cube so it gets pushed
-                float spawnOffsetX = cubeHalfX + sphereRadius + 0.15f; // In front of cube
-                float spawnOffsetZ = ((float)GetRandomValue(-50, 50) / 100.0f) * cubeHalfZ;
-                float spawnY = cubePosition.y - cubeHalfY + sphereRadius;
-                
-                // Spawn in front of the cube (positive X direction since cube moves right)
-                Vector3 sphereSpawnPos = {
-                    cubePosition.x + spawnOffsetX, // Spawn IN FRONT of the cube
-                    spawnY + 0.3f,
-                    cubePosition.z + spawnOffsetZ
-                };
+                // Spawn sphere at a random dug terrain location
+                Vector3 sphereSpawnPos;
+                if (!dugTerrainPositions.empty()) {
+                    // Pick a random dug terrain position
+                    int randomIdx = GetRandomValue(0, (int)dugTerrainPositions.size() - 1);
+                    Vector3 terrainPos = dugTerrainPositions[randomIdx];
+                    
+                    // Spawn at terrain location with slight offset above
+                    sphereSpawnPos = {
+                        terrainPos.x,
+                        terrainPos.y + sphereRadius + 0.2f,
+                        terrainPos.z
+                    };
+                } else {
+                    // Fallback: spawn near cube position
+                    float spawnOffsetX = cubeHalfX + sphereRadius + 0.15f;
+                    float spawnOffsetZ = ((float)GetRandomValue(-50, 50) / 100.0f) * cubeHalfZ;
+                    float spawnY = cubePosition.y - cubeHalfY + sphereRadius;
+                    
+                    sphereSpawnPos = {
+                        cubePosition.x + spawnOffsetX,
+                        spawnY + 0.3f,
+                        cubePosition.z + spawnOffsetZ
+                    };
+                }
                 
                 // Create sphere shape
                 SphereShapeSettings sphere_shape_settings(sphereRadius);
@@ -756,9 +777,9 @@ int main() {
                     float worldZ = (float)pos.GetZ();
                     
                     const float sphereVol = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
-                    float densityAmt = sphereVol * 100.0f;
+                    float densityAmt = sphereVol * 250.0f;
                     ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
-                                  2.0f, densityAmt, 0.15f, terrainScale, heightmapSize);
+                                  1.0f, densityAmt, 0.15f, terrainScale, heightmapSize);
                     sphere.markedForDestruction = true;
                     converted++;
                 }
@@ -817,9 +838,10 @@ int main() {
                 const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
                 
                 // Convert sphere to terrain height
-                float densityAmount = sphereVolume * 100.0f;
+                // Use smaller radius to concentrate material and higher multiplier to account for density->height conversion
+                float densityAmount = sphereVolume * 250.0f;
                 ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
-                              2.0f, densityAmount, 0.15f, terrainScale, heightmapSize);
+                              1.0f, densityAmount, 0.15f, terrainScale, heightmapSize);
                 densityAdded = true;
                 sphere.markedForDestruction = true;
             }
