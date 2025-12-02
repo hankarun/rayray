@@ -52,6 +52,7 @@ set(SOURCES
     src/ParticleVoxelGrid.cpp
     src/PerlinNoise.cpp
     src/Helpers.cpp
+    src/MeshCutter.cpp
 )
 
 add_executable(hello_world ${SOURCES})
