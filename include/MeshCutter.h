@@ -2,12 +2,10 @@
 
 #include "raylib.h"
 #include "GeometryBuilder.h"
-#include <Jolt/Jolt.h>
-#include <Jolt/Physics/Body/BodyID.h>
-#include <Jolt/Physics/PhysicsSystem.h>
-#include <Jolt/Physics/Body/BodyInterface.h>
+#include "PhysicsInterface.h"
 #include <vector>
 #include <array>
+#include <memory>
 
 // Plane represented by normal and distance from origin
 struct CutPlane
@@ -37,7 +35,7 @@ struct MeshTriangle
 // Cuttable mesh with physics body
 struct CuttableMesh
 {
-    JPH::BodyID bodyID;
+    PhysicsBodyHandle bodyHandle;
     std::vector<MeshTriangle> triangles;
     Model model;
     ::Color color;       // Use global namespace
@@ -69,11 +67,11 @@ public:
     // Calculate center of mass for a mesh
     static Vector3 CalculateCenterOfMass(const std::vector<MeshTriangle>& triangles);
     
-    // Create convex hull shape from mesh for Jolt Physics
-    static JPH::Ref<JPH::Shape> CreateConvexHullShape(const std::vector<MeshTriangle>& triangles);
+    // Create convex hull shape from mesh for physics
+    static std::shared_ptr<IPhysicsShape> CreateConvexHullShape(IPhysicsWorld* world, const std::vector<MeshTriangle>& triangles);
     
-    // Create mesh shape from triangles for Jolt Physics
-    static JPH::Ref<JPH::Shape> CreateMeshShape(const std::vector<MeshTriangle>& triangles);
+    // Create mesh shape from triangles for physics
+    static std::shared_ptr<IPhysicsShape> CreateMeshShape(IPhysicsWorld* world, const std::vector<MeshTriangle>& triangles);
     
 private:
     // Clip a triangle against a plane
@@ -93,7 +91,7 @@ private:
 class CuttableMeshManager
 {
 public:
-    CuttableMeshManager(JPH::PhysicsSystem* physicsSystem);
+    CuttableMeshManager(IPhysicsWorld* physicsWorld);
     ~CuttableMeshManager();
     
     // Create a new cuttable cube
@@ -115,11 +113,11 @@ public:
     size_t GetMeshCount() const { return meshes.size(); }
     
 private:
-    JPH::PhysicsSystem* physicsSystem;
+    IPhysicsWorld* physicsWorld;
     std::vector<CuttableMesh*> meshes;
     
     // Create physics body for mesh
-    JPH::BodyID CreatePhysicsBody(const std::vector<MeshTriangle>& triangles, Vector3 position);
+    PhysicsBodyHandle CreatePhysicsBody(const std::vector<MeshTriangle>& triangles, Vector3 position);
     
     // Remove a mesh and its physics body
     void RemoveMesh(size_t index);

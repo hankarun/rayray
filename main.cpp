@@ -1,32 +1,10 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "MeshCutter.h"
-#include "PhysicsLayers.h"
+#include "PhysicsInterface.h"
+#include "JoltPhysicsBackend.h"
 
-#include <Jolt/Jolt.h>
-#include <Jolt/RegisterTypes.h>
-#include <Jolt/Core/Factory.h>
-#include <Jolt/Core/TempAllocator.h>
-#include <Jolt/Core/JobSystemThreadPool.h>
-#include <Jolt/Physics/PhysicsSettings.h>
-#include <Jolt/Physics/PhysicsSystem.h>
-#include <Jolt/Physics/Collision/Shape/BoxShape.h>
-#include <Jolt/Physics/Body/BodyCreationSettings.h>
-
-using namespace JPH;
-
-// Jolt memory allocation hooks
-static void *JoltAlloc(size_t inSize) { return malloc(inSize); }
-static void JoltFree(void *inBlock) { free(inBlock); }
-
-#ifdef _WIN32
-#include <malloc.h>
-static void *JoltAlignedAlloc(size_t inSize, size_t inAlignment) { return _aligned_malloc(inSize, inAlignment); }
-static void JoltAlignedFree(void *inBlock) { _aligned_free(inBlock); }
-#else
-static void *JoltAlignedAlloc(size_t inSize, size_t inAlignment) { return aligned_alloc(inAlignment, inSize); }
-static void JoltAlignedFree(void *inBlock) { free(inBlock); }
-#endif
+#include <memory>
 
 int main()
 {
@@ -37,46 +15,37 @@ int main()
     InitWindow(screenWidth, screenHeight, "Mesh Cutting with Physics");
     SetTargetFPS(60);
 
-    // Initialize Jolt Physics
-    RegisterDefaultAllocator();
-    Factory::sInstance = new Factory();
-    RegisterTypes();
+    // Create physics world using the abstraction layer
+    // Change PhysicsBackend::Jolt to PhysicsBackend::PhysX when ready
+    auto physicsWorld = CreatePhysicsWorld(PhysicsBackend::Jolt);
+    
+    PhysicsWorldSettings worldSettings;
+    worldSettings.gravity = { 0, -9.81f, 0 };
+    worldSettings.maxBodies = 1024;
+    worldSettings.maxBodyPairs = 1024;
+    worldSettings.maxContactConstraints = 1024;
+    
+    if (!physicsWorld->Initialize(worldSettings))
+    {
+        CloseWindow();
+        return -1;
+    }
 
-    // Setup Jolt allocators
-    TempAllocatorImpl tempAllocator(10 * 1024 * 1024);
-    JobSystemThreadPool jobSystem(cMaxPhysicsJobs, cMaxPhysicsBarriers,
-                                  std::thread::hardware_concurrency() - 1);
-
-    // Physics system configuration
-    const uint maxBodies = 1024;
-    const uint numBodyMutexes = 0;
-    const uint maxBodyPairs = 1024;
-    const uint maxContactConstraints = 1024;
-
-    BPLayerInterfaceImpl broadPhaseLayerInterface;
-    ObjectVsBroadPhaseLayerFilterImpl objectVsBroadPhaseLayerFilter;
-    ObjectLayerPairFilterImpl objectLayerPairFilter;
-
-    PhysicsSystem physicsSystem;
-    physicsSystem.Init(maxBodies, numBodyMutexes, maxBodyPairs, maxContactConstraints,
-                       broadPhaseLayerInterface, objectVsBroadPhaseLayerFilter,
-                       objectLayerPairFilter);
-
-    physicsSystem.SetGravity(Vec3(0, -9.81f, 0));
-
-    // Create ground plane
-    BodyInterface &bodyInterface = physicsSystem.GetBodyInterface();
-    BoxShapeSettings groundShapeSettings(Vec3(50.0f, 0.5f, 50.0f));
-    BodyCreationSettings groundSettings(
-        groundShapeSettings.Create().Get(),
-        RVec3(0, -0.5f, 0),
-        Quat::sIdentity(),
-        EMotionType::Static,
-        Layers::NON_MOVING);
-    bodyInterface.CreateAndAddBody(groundSettings, EActivation::DontActivate);
+    // Create ground plane using the physics interface
+    BoxShapeSettings groundShapeSettings;
+    groundShapeSettings.halfExtents = { 50.0f, 0.5f, 50.0f };
+    auto groundShape = physicsWorld->CreateBoxShape(groundShapeSettings);
+    
+    PhysicsBodySettings groundSettings;
+    groundSettings.motionType = PhysicsMotionType::Static;
+    groundSettings.layer = PhysicsLayer::NonMoving;
+    groundSettings.transform.position = { 0, -0.5f, 0 };
+    groundSettings.transform.rotation = PhysicsHelpers::QuaternionIdentity();
+    
+    physicsWorld->CreateBody(groundShape, groundSettings);
 
     // Create mesh manager
-    CuttableMeshManager meshManager(&physicsSystem);
+    CuttableMeshManager meshManager(physicsWorld.get());
 
     // Create initial cube
     meshManager.CreateCube({0, 5, 0}, 2.0f, ::RED);
@@ -183,6 +152,7 @@ int main()
         // Reset scene
         if (IsKeyPressed(KEY_R))
         {
+            meshManager = CuttableMeshManager(physicsWorld.get());
             // Will need to properly reset - for now just add a new cube
             meshManager.CreateCube({0, 5, 0}, 2.0f, ::RED);
         }
@@ -191,7 +161,7 @@ int main()
         physicsAccumulator += deltaTime;
         while (physicsAccumulator >= physicsTimeStep)
         {
-            physicsSystem.Update(physicsTimeStep, 1, &tempAllocator, &jobSystem);
+            physicsWorld->Step(physicsTimeStep);
             physicsAccumulator -= physicsTimeStep;
         }
 
@@ -303,11 +273,8 @@ int main()
     }
 
     // Cleanup
+    physicsWorld->Shutdown();
     CloseWindow();
-
-    // Cleanup Jolt
-    delete Factory::sInstance;
-    Factory::sInstance = nullptr;
 
     return 0;
 }

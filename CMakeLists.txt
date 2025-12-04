@@ -54,7 +54,16 @@ set(SOURCES
     src/Helpers.cpp
     src/MeshCutter.cpp
     src/GeometryBuilder.cpp
+    src/JoltPhysicsBackend.cpp
 )
+
+# Optional: Enable PhysX backend (uncomment when PhysX is available)
+# option(USE_PHYSX "Enable NVIDIA PhysX backend" OFF)
+# if(USE_PHYSX)
+#     find_package(PhysX REQUIRED)
+#     target_compile_definitions(hello_world PRIVATE USE_PHYSX)
+#     target_link_libraries(hello_world PhysX PhysXCooking PhysXCommon PhysXFoundation)
+# endif()
 
 add_executable(hello_world ${SOURCES})
 

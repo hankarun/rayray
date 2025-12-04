@@ -1,18 +1,10 @@
-// Include raylib first, before any Jolt headers to avoid type conflicts
+// Include raylib first, before any other headers to avoid type conflicts
 #include "raylib.h"
 #include "raymath.h"
 
-// Now include Jolt headers
-#include <Jolt/Jolt.h>
-#include <Jolt/Physics/Body/BodyCreationSettings.h>
-#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
-#include <Jolt/Physics/Collision/Shape/BoxShape.h>
-#include <Jolt/Physics/Collision/Shape/MeshShape.h>
-
-// Include our header after both
+// Include our header
 #include "MeshCutter.h"
 #include "GeometryBuilder.h"
-#include "PhysicsLayers.h"
 #include <algorithm>
 #include <cmath>
 
@@ -388,31 +380,21 @@ Vector3 MeshCutter::CalculateCenterOfMass(const std::vector<MeshTriangle>& trian
     return center;
 }
 
-JPH::Ref<JPH::Shape> MeshCutter::CreateConvexHullShape(const std::vector<MeshTriangle>& triangles)
+std::shared_ptr<IPhysicsShape> MeshCutter::CreateConvexHullShape(IPhysicsWorld* world, const std::vector<MeshTriangle>& triangles)
 {
-    // Collect all unique vertices
-    std::vector<JPH::Vec3> points;
-    points.reserve(triangles.size() * 3);
+    // Collect all vertices
+    ConvexHullShapeSettings settings;
+    settings.points.reserve(triangles.size() * 3);
+    settings.maxConvexRadius = 0.01f;
     
     for (const auto& tri : triangles)
     {
-        points.push_back(JPH::Vec3(tri.v0.x, tri.v0.y, tri.v0.z));
-        points.push_back(JPH::Vec3(tri.v1.x, tri.v1.y, tri.v1.z));
-        points.push_back(JPH::Vec3(tri.v2.x, tri.v2.y, tri.v2.z));
+        settings.points.push_back(tri.v0);
+        settings.points.push_back(tri.v1);
+        settings.points.push_back(tri.v2);
     }
     
-    // Create convex hull
-    JPH::ConvexHullShapeSettings settings(points.data(), (int)points.size());
-    settings.mMaxConvexRadius = 0.01f;
-    
-    auto result = settings.Create();
-    if (result.HasError())
-    {
-        // Fallback to a small box if convex hull fails
-        return new JPH::BoxShape(JPH::Vec3(0.1f, 0.1f, 0.1f));
-    }
-    
-    return result.Get();
+    return world->CreateConvexHullShape(settings);
 }
 
 // CuttableMesh implementation
@@ -435,8 +417,8 @@ void CuttableMesh::Unload()
 }
 
 // CuttableMeshManager implementation
-CuttableMeshManager::CuttableMeshManager(JPH::PhysicsSystem* system)
-    : physicsSystem(system)
+CuttableMeshManager::CuttableMeshManager(IPhysicsWorld* world)
+    : physicsWorld(world)
 {
 }
 
@@ -444,6 +426,7 @@ CuttableMeshManager::~CuttableMeshManager()
 {
     for (auto* mesh : meshes)
     {
+        physicsWorld->DestroyBody(mesh->bodyHandle);
         mesh->Unload();
         delete mesh;
     }
@@ -459,7 +442,7 @@ CuttableMesh* CuttableMeshManager::CreateCube(Vector3 position, float size, ::Co
     mesh->centerOfMass = MeshCutter::CalculateCenterOfMass(mesh->triangles);
     
     // Create physics body
-    mesh->bodyID = CreatePhysicsBody(mesh->triangles, position);
+    mesh->bodyHandle = CreatePhysicsBody(mesh->triangles, position);
     
     // Create visual model
     mesh->UpdateModel();
@@ -477,7 +460,7 @@ CuttableMesh* CuttableMeshManager::CreateSphere(Vector3 position, float radius, 
     mesh->centerOfMass = MeshCutter::CalculateCenterOfMass(mesh->triangles);
     
     // Create physics body
-    mesh->bodyID = CreatePhysicsBody(mesh->triangles, position);
+    mesh->bodyHandle = CreatePhysicsBody(mesh->triangles, position);
     
     // Create visual model
     mesh->UpdateModel();
@@ -486,31 +469,28 @@ CuttableMesh* CuttableMeshManager::CreateSphere(Vector3 position, float radius, 
     return mesh;
 }
 
-JPH::BodyID CuttableMeshManager::CreatePhysicsBody(const std::vector<MeshTriangle>& triangles, Vector3 position)
+PhysicsBodyHandle CuttableMeshManager::CreatePhysicsBody(const std::vector<MeshTriangle>& triangles, Vector3 position)
 {
-    JPH::BodyInterface& bodyInterface = physicsSystem->GetBodyInterface();
-    
     // Create convex hull shape from mesh
-    JPH::Ref<JPH::Shape> shape = MeshCutter::CreateConvexHullShape(triangles);
+    auto shape = MeshCutter::CreateConvexHullShape(physicsWorld, triangles);
     
-    // Create body
-    JPH::BodyCreationSettings settings(
-        shape,
-        JPH::RVec3(position.x, position.y, position.z),
-        JPH::Quat::sIdentity(),
-        JPH::EMotionType::Dynamic,
-        Layers::MOVING
-    );
-    settings.mRestitution = 0.3f;
-    settings.mFriction = 0.5f;
+    if (!shape)
+        return PhysicsBodyHandle::Invalid();
     
-    JPH::BodyID bodyID = bodyInterface.CreateAndAddBody(settings, JPH::EActivation::Activate);
-    return bodyID;
+    // Create body settings
+    PhysicsBodySettings settings;
+    settings.motionType = PhysicsMotionType::Dynamic;
+    settings.layer = PhysicsLayer::Moving;
+    settings.transform.position = position;
+    settings.transform.rotation = PhysicsHelpers::QuaternionIdentity();
+    settings.friction = 0.5f;
+    settings.restitution = 0.3f;
+    
+    return physicsWorld->CreateBody(shape, settings);
 }
 
 void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorldPos)
 {
-    JPH::BodyInterface& bodyInterface = physicsSystem->GetBodyInterface();
     std::vector<CuttableMesh*> newMeshes;
     
     for (size_t i = 0; i < meshes.size(); i++)
@@ -519,30 +499,33 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
         if (mesh->markedForDestruction) continue;
         
         // Get body transform
-        JPH::RVec3 bodyPos;
-        JPH::Quat bodyRot;
-        bodyInterface.GetPositionAndRotation(mesh->bodyID, bodyPos, bodyRot);
+        PhysicsTransform bodyTransform = physicsWorld->GetBodyTransform(mesh->bodyHandle);
+        Vector4 bodyRot = bodyTransform.rotation;
+        Vector3 bodyPos = bodyTransform.position;
         
-        // Transform plane to local space of the body
-        // First, get the inverse rotation
-        JPH::Quat invRot = bodyRot.Conjugated();
+        // Get the inverse rotation (conjugate for unit quaternions)
+        Vector4 invRot = PhysicsHelpers::QuaternionConjugate(bodyRot);
         
         // Transform plane normal to local space
-        JPH::Vec3 worldNormal(plane.normal.x, plane.normal.y, plane.normal.z);
-        JPH::Vec3 localNormal = invRot * worldNormal;
+        Vector3 worldNormal = plane.normal;
+        Vector3 localNormal = PhysicsHelpers::QuaternionRotateVector(invRot, worldNormal);
         
         // Transform a point on the plane to local space
-        JPH::Vec3 worldPoint(
+        Vector3 worldPoint = {
             plane.normal.x * plane.distance,
             plane.normal.y * plane.distance,
             plane.normal.z * plane.distance
-        );
-        JPH::Vec3 localPoint = invRot * (worldPoint - JPH::Vec3(bodyPos));
+        };
         
-        CutPlane localPlane = CutPlane::FromPointNormal(
-            { localPoint.GetX(), localPoint.GetY(), localPoint.GetZ() },
-            { localNormal.GetX(), localNormal.GetY(), localNormal.GetZ() }
-        );
+        // localPoint = invRot * (worldPoint - bodyPos)
+        Vector3 relPoint = {
+            worldPoint.x - bodyPos.x,
+            worldPoint.y - bodyPos.y,
+            worldPoint.z - bodyPos.z
+        };
+        Vector3 localPoint = PhysicsHelpers::QuaternionRotateVector(invRot, relPoint);
+        
+        CutPlane localPlane = CutPlane::FromPointNormal(localPoint, localNormal);
         
         // Perform the cut
         CutResult result = MeshCutter::CutMesh(mesh->triangles, localPlane);
@@ -553,8 +536,7 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
             mesh->markedForDestruction = true;
             
             // Get current velocity
-            JPH::Vec3 linearVel = bodyInterface.GetLinearVelocity(mesh->bodyID);
-            JPH::Vec3 angularVel = bodyInterface.GetAngularVelocity(mesh->bodyID);
+            PhysicsVelocity velocity = physicsWorld->GetBodyVelocity(mesh->bodyHandle);
             
             // Create front mesh piece
             {
@@ -567,9 +549,14 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
                 Vector3 localCOM = MeshCutter::CalculateCenterOfMass(result.frontMesh);
                 
                 // Transform local COM to world space
-                JPH::Vec3 worldCOM = bodyRot * JPH::Vec3(localCOM.x, localCOM.y, localCOM.z) + JPH::Vec3(bodyPos);
+                Vector3 rotatedCOM = PhysicsHelpers::QuaternionRotateVector(bodyRot, localCOM);
+                Vector3 worldCOM = {
+                    rotatedCOM.x + bodyPos.x,
+                    rotatedCOM.y + bodyPos.y,
+                    rotatedCOM.z + bodyPos.z
+                };
                 
-                frontMesh->centerOfMass = { worldCOM.GetX(), worldCOM.GetY(), worldCOM.GetZ() };
+                frontMesh->centerOfMass = worldCOM;
                 
                 // Center the mesh triangles around their center of mass
                 for (auto& tri : frontMesh->triangles)
@@ -580,12 +567,17 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
                 }
                 
                 // Create physics body at the world COM position
-                frontMesh->bodyID = CreatePhysicsBody(frontMesh->triangles, frontMesh->centerOfMass);
+                frontMesh->bodyHandle = CreatePhysicsBody(frontMesh->triangles, frontMesh->centerOfMass);
                 
                 // Apply original velocity plus a small impulse away from cut
-                JPH::Vec3 impulse = worldNormal * 0.5f;
-                bodyInterface.SetLinearVelocity(frontMesh->bodyID, linearVel + impulse);
-                bodyInterface.SetAngularVelocity(frontMesh->bodyID, angularVel);
+                Vector3 impulse = { worldNormal.x * 0.5f, worldNormal.y * 0.5f, worldNormal.z * 0.5f };
+                Vector3 newVel = {
+                    velocity.linear.x + impulse.x,
+                    velocity.linear.y + impulse.y,
+                    velocity.linear.z + impulse.z
+                };
+                physicsWorld->SetLinearVelocity(frontMesh->bodyHandle, newVel);
+                physicsWorld->SetAngularVelocity(frontMesh->bodyHandle, velocity.angular);
                 
                 frontMesh->UpdateModel();
                 newMeshes.push_back(frontMesh);
@@ -602,9 +594,14 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
                 Vector3 localCOM = MeshCutter::CalculateCenterOfMass(result.backMesh);
                 
                 // Transform local COM to world space
-                JPH::Vec3 worldCOM = bodyRot * JPH::Vec3(localCOM.x, localCOM.y, localCOM.z) + JPH::Vec3(bodyPos);
+                Vector3 rotatedCOM = PhysicsHelpers::QuaternionRotateVector(bodyRot, localCOM);
+                Vector3 worldCOM = {
+                    rotatedCOM.x + bodyPos.x,
+                    rotatedCOM.y + bodyPos.y,
+                    rotatedCOM.z + bodyPos.z
+                };
                 
-                backMesh->centerOfMass = { worldCOM.GetX(), worldCOM.GetY(), worldCOM.GetZ() };
+                backMesh->centerOfMass = worldCOM;
                 
                 // Center the mesh triangles around their center of mass
                 for (auto& tri : backMesh->triangles)
@@ -615,12 +612,17 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
                 }
                 
                 // Create physics body at the world COM position
-                backMesh->bodyID = CreatePhysicsBody(backMesh->triangles, backMesh->centerOfMass);
+                backMesh->bodyHandle = CreatePhysicsBody(backMesh->triangles, backMesh->centerOfMass);
                 
                 // Apply original velocity plus a small impulse away from cut (opposite direction)
-                JPH::Vec3 impulse = worldNormal * -0.5f;
-                bodyInterface.SetLinearVelocity(backMesh->bodyID, linearVel + impulse);
-                bodyInterface.SetAngularVelocity(backMesh->bodyID, angularVel);
+                Vector3 impulse = { -worldNormal.x * 0.5f, -worldNormal.y * 0.5f, -worldNormal.z * 0.5f };
+                Vector3 newVel = {
+                    velocity.linear.x + impulse.x,
+                    velocity.linear.y + impulse.y,
+                    velocity.linear.z + impulse.z
+                };
+                physicsWorld->SetLinearVelocity(backMesh->bodyHandle, newVel);
+                physicsWorld->SetAngularVelocity(backMesh->bodyHandle, velocity.angular);
                 
                 backMesh->UpdateModel();
                 newMeshes.push_back(backMesh);
@@ -637,8 +639,6 @@ void CuttableMeshManager::CutWithPlane(const CutPlane& plane, Vector3 planeWorld
 
 void CuttableMeshManager::Update(float deltaTime)
 {
-    JPH::BodyInterface& bodyInterface = physicsSystem->GetBodyInterface();
-    
     // Remove destroyed meshes
     for (size_t i = meshes.size(); i > 0; i--)
     {
@@ -651,32 +651,26 @@ void CuttableMeshManager::Update(float deltaTime)
 
 void CuttableMeshManager::Draw()
 {
-    JPH::BodyInterface& bodyInterface = physicsSystem->GetBodyInterface();
-    
     for (auto* mesh : meshes)
     {
         if (mesh->markedForDestruction) continue;
         
         // Get body transform
-        JPH::RVec3 pos;
-        JPH::Quat rot;
-        bodyInterface.GetPositionAndRotation(mesh->bodyID, pos, rot);
-        
-        // Convert to raylib types
-        Vector3 position = { (float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ() };
+        PhysicsTransform transform = physicsWorld->GetBodyTransform(mesh->bodyHandle);
         
         // Convert quaternion to axis-angle for raylib
-        JPH::Vec3 axis;
+        Vector3 axis;
         float angle;
-        rot.GetAxisAngle(axis, angle);
+        PhysicsHelpers::QuaternionToAxisAngle(transform.rotation, axis, angle);
         
         // Create transform matrix
-        ::Matrix transform = MatrixIdentity();
-        transform = MatrixMultiply(transform, MatrixRotate({ axis.GetX(), axis.GetY(), axis.GetZ() }, angle));
-        transform = MatrixMultiply(transform, MatrixTranslate(position.x, position.y, position.z));
+        ::Matrix modelTransform = MatrixIdentity();
+        modelTransform = MatrixMultiply(modelTransform, MatrixRotate(axis, angle));
+        modelTransform = MatrixMultiply(modelTransform, MatrixTranslate(
+            transform.position.x, transform.position.y, transform.position.z));
         
         // Draw model with transform
-        mesh->model.transform = transform;
+        mesh->model.transform = modelTransform;
         DrawModel(mesh->model, { 0, 0, 0 }, 1.0f, mesh->color);
         
         // Draw wireframe for visibility
@@ -692,9 +686,7 @@ void CuttableMeshManager::RemoveMesh(size_t index)
     CuttableMesh* mesh = meshes[index];
     
     // Remove physics body
-    JPH::BodyInterface& bodyInterface = physicsSystem->GetBodyInterface();
-    bodyInterface.RemoveBody(mesh->bodyID);
-    bodyInterface.DestroyBody(mesh->bodyID);
+    physicsWorld->DestroyBody(mesh->bodyHandle);
     
     // Unload mesh
     mesh->Unload();
