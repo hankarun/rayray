@@ -53,6 +53,7 @@ set(SOURCES
     src/PerlinNoise.cpp
     src/Helpers.cpp
     src/MeshCutter.cpp
+    src/GeometryBuilder.cpp
 )
 
 add_executable(hello_world ${SOURCES})

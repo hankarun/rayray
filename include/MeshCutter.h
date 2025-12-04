@@ -1,6 +1,7 @@
 #pragma once
 
 #include "raylib.h"
+#include "GeometryBuilder.h"
 #include <Jolt/Jolt.h>
 #include <Jolt/Physics/Body/BodyID.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -64,12 +65,6 @@ class MeshCutter
 public:
     // Cut a mesh with a plane, returns two sets of triangles
     static CutResult CutMesh(const std::vector<MeshTriangle>& triangles, const CutPlane& plane);
-    
-    // Create a cube mesh
-    static std::vector<MeshTriangle> CreateCubeMesh(float size, ::Color color);
-    
-    // Create a sphere mesh
-    static std::vector<MeshTriangle> CreateSphereMesh(float radius, int rings, int slices, ::Color color);
     
     // Calculate center of mass for a mesh
     static Vector3 CalculateCenterOfMass(const std::vector<MeshTriangle>& triangles);
