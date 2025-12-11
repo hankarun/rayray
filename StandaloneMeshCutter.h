@@ -213,7 +213,10 @@ private:
     {
         float da = plane.SignedDistance(a);
         float db = plane.SignedDistance(b);
-        return da / (da - db);
+        float denom = da - db;
+        // Safety check: if points are equidistant (shouldn't happen when edge crosses plane)
+        if (fabsf(denom) < 0.000001f) return 0.5f;
+        return da / denom;
     }
     
     // Clip a triangle against a plane
@@ -379,16 +382,25 @@ private:
     }
     
     // Remove duplicate points within a threshold
+    // Note: O(n²) complexity, but acceptable since n is typically small (<20 points)
+    // for mesh cutting operations. Using spatial hashing would add complexity
+    // without significant benefit for small point sets.
     static void RemoveDuplicatePoints(std::vector<Vector3>& points, float threshold = 0.001f)
     {
+        if (points.empty()) return;
+        
         std::vector<Vector3> unique;
+        unique.reserve(points.size()); // Pre-allocate to avoid reallocations
+        
+        float thresholdSq = threshold * threshold;
+        
         for (const auto& p : points)
         {
             bool isDuplicate = false;
             for (const auto& u : unique)
             {
                 Vector3 diff = p - u;
-                if (diff.Dot(diff) < threshold * threshold)
+                if (diff.Dot(diff) < thresholdSq)
                 {
                     isDuplicate = true;
                     break;
@@ -399,7 +411,7 @@ private:
                 unique.push_back(p);
             }
         }
-        points = unique;
+        points = std::move(unique); // Use move to avoid copy
     }
     
     // Generate cap triangles from cut edge points
