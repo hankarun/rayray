@@ -1,3 +1,7 @@
 build/
 .build/
 .cache/
+test_standalone_cutter
+test_standalone_cutter.exe
+integration_example
+integration_example.exe
