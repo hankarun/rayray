@@ -15,6 +15,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyActivationListener.h>
 
@@ -25,34 +26,158 @@
 #include "ParticleVoxelGrid.h"
 #include "PerlinNoise.h"
 #include "Helpers.h"
+#include "Blade.h"
+#include "ExcavatorBucket.h"
 
 // Jolt namespace
 using namespace JPH;
 
+// Bucket scoop state machine
+enum class ScoopState {
+    IDLE,           // Waiting at start position
+    MOVING_TO_DIG,  // Moving towards dig position
+    DIGGING,        // Lowering and scooping terrain
+    LIFTING,        // Lifting bucket with material
+    MOVING_TO_DROP, // Moving towards drop position
+    DROPPING,       // Tilting bucket to drop material
+    RETURNING       // Returning to start position
+};
+
+const char* GetStateName(ScoopState state) {
+    switch (state) {
+        case ScoopState::IDLE: return "IDLE";
+        case ScoopState::MOVING_TO_DIG: return "MOVING TO DIG";
+        case ScoopState::DIGGING: return "DIGGING";
+        case ScoopState::LIFTING: return "LIFTING";
+        case ScoopState::MOVING_TO_DROP: return "MOVING TO DROP";
+        case ScoopState::DROPPING: return "DROPPING";
+        case ScoopState::RETURNING: return "RETURNING";
+        default: return "UNKNOWN";
+    }
+}
+
+// Helper to create a bucket/scoop compound shape from multiple boxes
+ShapeRefC CreateBucketShape(float bucketWidth, float bucketDepth, float bucketHeight, float wallThickness) {
+    StaticCompoundShapeSettings compound_settings;
+    
+    // Use a small convex radius that's less than the smallest half-extent (wallThickness/2)
+    float convexRadius = wallThickness * 0.25f;  // 25% of wall thickness
+    
+    // Bottom plate
+    BoxShapeSettings bottom_settings(Vec3(bucketWidth / 2.0f, wallThickness / 2.0f, bucketDepth / 2.0f), convexRadius);
+    ShapeRefC bottom_shape = bottom_settings.Create().Get();
+    compound_settings.AddShape(Vec3(0, wallThickness / 2.0f, 0), Quat::sIdentity(), bottom_shape);
+    
+    // Left wall
+    BoxShapeSettings left_settings(Vec3(wallThickness / 2.0f, bucketHeight / 2.0f, bucketDepth / 2.0f), convexRadius);
+    ShapeRefC left_shape = left_settings.Create().Get();
+    compound_settings.AddShape(Vec3(-bucketWidth / 2.0f - wallThickness / 2.0f, bucketHeight / 2.0f + wallThickness, 0), 
+                               Quat::sIdentity(), left_shape);
+    
+    // Right wall
+    BoxShapeSettings right_settings(Vec3(wallThickness / 2.0f, bucketHeight / 2.0f, bucketDepth / 2.0f), convexRadius);
+    ShapeRefC right_shape = right_settings.Create().Get();
+    compound_settings.AddShape(Vec3(bucketWidth / 2.0f + wallThickness / 2.0f, bucketHeight / 2.0f + wallThickness, 0), 
+                               Quat::sIdentity(), right_shape);
+    
+    // Back wall
+    BoxShapeSettings back_settings(Vec3(bucketWidth / 2.0f + wallThickness, bucketHeight / 2.0f, wallThickness / 2.0f), convexRadius);
+    ShapeRefC back_shape = back_settings.Create().Get();
+    compound_settings.AddShape(Vec3(0, bucketHeight / 2.0f + wallThickness, -bucketDepth / 2.0f - wallThickness / 2.0f), 
+                               Quat::sIdentity(), back_shape);
+    
+    // Front lip
+    BoxShapeSettings lip_settings(Vec3(bucketWidth / 2.0f + wallThickness, wallThickness / 2.0f, wallThickness / 2.0f), convexRadius);
+    ShapeRefC lip_shape = lip_settings.Create().Get();
+    compound_settings.AddShape(Vec3(0, wallThickness / 2.0f, bucketDepth / 2.0f + wallThickness / 2.0f), 
+                               Quat::sIdentity(), lip_shape);
+    
+    return compound_settings.Create().Get();
+}
+
+// Helper to create raylib mesh for bucket visualization
+Model CreateBucketModel(float bucketWidth, float bucketDepth, float bucketHeight, float wallThickness, Shader shader) {
+    Mesh bucketMesh = { 0 };
+    int triangleCount = 5 * 12;
+    
+    bucketMesh.vertexCount = triangleCount * 3;
+    bucketMesh.triangleCount = triangleCount;
+    bucketMesh.vertices = (float*)RL_MALLOC(bucketMesh.vertexCount * 3 * sizeof(float));
+    bucketMesh.normals = (float*)RL_MALLOC(bucketMesh.vertexCount * 3 * sizeof(float));
+    
+    int vi = 0;
+    
+    auto addBox = [&](float cx, float cy, float cz, float hw, float hh, float hd) {
+        float vertices[8][3] = {
+            {cx - hw, cy - hh, cz + hd}, {cx + hw, cy - hh, cz + hd},
+            {cx + hw, cy + hh, cz + hd}, {cx - hw, cy + hh, cz + hd},
+            {cx - hw, cy - hh, cz - hd}, {cx + hw, cy - hh, cz - hd},
+            {cx + hw, cy + hh, cz - hd}, {cx - hw, cy + hh, cz - hd}
+        };
+        int faces[6][4] = {{0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0}};
+        float normals[6][3] = {{0,0,1}, {0,0,-1}, {-1,0,0}, {1,0,0}, {0,1,0}, {0,-1,0}};
+        
+        for (int f = 0; f < 6; f++) {
+            for (int i = 0; i < 3; i++) {
+                int idx = (i == 0) ? 0 : (i == 1) ? 1 : 2;
+                bucketMesh.vertices[vi*3] = vertices[faces[f][idx]][0];
+                bucketMesh.vertices[vi*3+1] = vertices[faces[f][idx]][1];
+                bucketMesh.vertices[vi*3+2] = vertices[faces[f][idx]][2];
+                bucketMesh.normals[vi*3] = normals[f][0];
+                bucketMesh.normals[vi*3+1] = normals[f][1];
+                bucketMesh.normals[vi*3+2] = normals[f][2];
+                vi++;
+            }
+            for (int i = 0; i < 3; i++) {
+                int idx = (i == 0) ? 0 : (i == 1) ? 2 : 3;
+                bucketMesh.vertices[vi*3] = vertices[faces[f][idx]][0];
+                bucketMesh.vertices[vi*3+1] = vertices[faces[f][idx]][1];
+                bucketMesh.vertices[vi*3+2] = vertices[faces[f][idx]][2];
+                bucketMesh.normals[vi*3] = normals[f][0];
+                bucketMesh.normals[vi*3+1] = normals[f][1];
+                bucketMesh.normals[vi*3+2] = normals[f][2];
+                vi++;
+            }
+        }
+    };
+    
+    float wt = wallThickness, bw = bucketWidth, bd = bucketDepth, bh = bucketHeight;
+    addBox(0, wt/2.0f, 0, bw/2.0f, wt/2.0f, bd/2.0f);
+    addBox(-bw/2.0f - wt/2.0f, bh/2.0f + wt, 0, wt/2.0f, bh/2.0f, bd/2.0f);
+    addBox(bw/2.0f + wt/2.0f, bh/2.0f + wt, 0, wt/2.0f, bh/2.0f, bd/2.0f);
+    addBox(0, bh/2.0f + wt, -bd/2.0f - wt/2.0f, bw/2.0f + wt, bh/2.0f, wt/2.0f);
+    addBox(0, wt/2.0f, bd/2.0f + wt/2.0f, bw/2.0f + wt, wt/2.0f, wt/2.0f);
+    
+    UploadMesh(&bucketMesh, false);
+    Model model = LoadModelFromMesh(bucketMesh);
+    model.materials[0].shader = shader;
+    return model;
+}
+
 int main() {
-    const int screenWidth = 800;
-    const int screenHeight = 450;
+    const int screenWidth = 1200;
+    const int screenHeight = 800;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(screenWidth, screenHeight, "Jolt Physics with Heightmap - raylib");
+    InitWindow(screenWidth, screenHeight, "Terrain Scoop Simulation - Jolt Physics + raylib");
 
-    // Initialize Jolt Physics
+    // Initialize Jolt Physics - MUST be done before creating any shapes
     RegisterDefaultAllocator();
     Factory::sInstance = new Factory();
     RegisterTypes();
+    
+    printf("DEBUG: Jolt Physics initialized\n"); fflush(stdout);
 
-    // Create temp allocator
     TempAllocatorImpl temp_allocator(10 * 1024 * 1024);
-
-    // Create job system
     JobSystemThreadPool job_system(cMaxPhysicsJobs, cMaxPhysicsBarriers, thread::hardware_concurrency() - 1);
+    
+    printf("DEBUG: Temp allocator and job system created\n"); fflush(stdout);
 
-    // Create physics system
-    const uint cMaxBodies = 2048;
+    const uint cMaxBodies = 4096;
     const uint cNumBodyMutexes = 0;
-    const uint cMaxBodyPairs = 4096;
-    const uint cMaxContactConstraints = 4096;
-    const int maxSphereCount = 200; // Limit sphere count to prevent physics overload
+    const uint cMaxBodyPairs = 8192;
+    const uint cMaxContactConstraints = 8192;
+    const int maxSphereCount = 500;
 
     BPLayerInterfaceImpl broad_phase_layer_interface;
     ObjectVsBroadPhaseLayerFilterImpl object_vs_broadphase_layer_filter;
@@ -62,14 +187,16 @@ int main() {
     physics_system.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints,
         broad_phase_layer_interface, object_vs_broadphase_layer_filter, object_vs_object_layer_filter);
 
-    // Contact listener
     MyContactListener contact_listener;
     physics_system.SetContactListener(&contact_listener);
 
     BodyInterface &body_interface = physics_system.GetBodyInterface();
+    
+    printf("DEBUG: Physics system initialized\n"); fflush(stdout);
 
+    // Camera setup
     Camera3D camera = { 0 };
-    camera.position = Vector3{ 10.0f, 10.0f, 10.0f };
+    camera.position = Vector3{ 8.0f, 6.0f, 8.0f };
     camera.target = Vector3{ 0.0f, 0.0f, 0.0f };
     camera.up = Vector3{ 0.0f, 1.0f, 0.0f };
     camera.fovy = 45.0f;
@@ -78,16 +205,12 @@ int main() {
     float cameraYaw = atan2f(camera.position.z - camera.target.z, camera.position.x - camera.target.x);
     float cameraRadius = Vector3Distance(camera.position, camera.target);
     float cameraPitch = asinf((camera.position.y - camera.target.y) / cameraRadius);
-
     Vector2 previousMousePos = GetMousePosition();
 
-    // Load shader
+    // Load shaders
     Shader shader = LoadShader("shaders/directional_light.vs", "shaders/directional_light.fs");
-    
-    // Load heightmap shader
     Shader heightmapShader = LoadShader("shaders/heightmap.vs", "shaders/heightmap.fs");
     
-    // Get shader uniform locations for directional light shader
     int lightDirLoc = GetShaderLocation(shader, "lightDirection");
     int lightColorLoc = GetShaderLocation(shader, "lightColor");
     int ambientColorLoc = GetShaderLocation(shader, "ambientColor");
@@ -96,7 +219,6 @@ int main() {
     int specularStrengthLoc = GetShaderLocation(shader, "specularStrength");
     int shininessLoc = GetShaderLocation(shader, "shininess");
     
-    // Get shader uniform locations for heightmap shader
     int hm_lightDirLoc = GetShaderLocation(heightmapShader, "lightDirection");
     int hm_lightColorLoc = GetShaderLocation(heightmapShader, "lightColor");
     int hm_ambientColorLoc = GetShaderLocation(heightmapShader, "ambientColor");
@@ -106,17 +228,11 @@ int main() {
     int hm_shininessLoc = GetShaderLocation(heightmapShader, "shininess");
     int hm_heightScaleLoc = GetShaderLocation(heightmapShader, "heightScale");
     
-    // Set up directional light properties
-    Vector3 lightDirection = { -0.5f, -1.0f, -0.3f };
-    lightDirection = Vector3Normalize(lightDirection);
+    Vector3 lightDirection = Vector3Normalize(Vector3{ -0.5f, -1.0f, -0.3f });
     Vector3 lightColor = { 1.0f, 1.0f, 1.0f };
     Vector3 ambientColor = { 0.3f, 0.3f, 0.3f };
-    float ambientStrength = 0.2f;
-    float specularStrength = 0.5f;
-    float shininess = 32.0f;
-    float lightAngle = 0.0f;
+    float ambientStrength = 0.3f, specularStrength = 0.5f, shininess = 32.0f;
     
-    // Set shader values
     SetShaderValue(shader, lightDirLoc, &lightDirection, SHADER_UNIFORM_VEC3);
     SetShaderValue(shader, lightColorLoc, &lightColor, SHADER_UNIFORM_VEC3);
     SetShaderValue(shader, ambientColorLoc, &ambientColor, SHADER_UNIFORM_VEC3);
@@ -124,1381 +240,555 @@ int main() {
     SetShaderValue(shader, specularStrengthLoc, &specularStrength, SHADER_UNIFORM_FLOAT);
     SetShaderValue(shader, shininessLoc, &shininess, SHADER_UNIFORM_FLOAT);
     
-    // Set heightmap shader values
+    float heightScale = 1.0f;
     SetShaderValue(heightmapShader, hm_lightDirLoc, &lightDirection, SHADER_UNIFORM_VEC3);
     SetShaderValue(heightmapShader, hm_lightColorLoc, &lightColor, SHADER_UNIFORM_VEC3);
     SetShaderValue(heightmapShader, hm_ambientColorLoc, &ambientColor, SHADER_UNIFORM_VEC3);
     SetShaderValue(heightmapShader, hm_ambientStrengthLoc, &ambientStrength, SHADER_UNIFORM_FLOAT);
     SetShaderValue(heightmapShader, hm_specularStrengthLoc, &specularStrength, SHADER_UNIFORM_FLOAT);
     SetShaderValue(heightmapShader, hm_shininessLoc, &shininess, SHADER_UNIFORM_FLOAT);
-    float heightScale = 2.0f;
     SetShaderValue(heightmapShader, hm_heightScaleLoc, &heightScale, SHADER_UNIFORM_FLOAT);
     
-    // Generate Perlin noise heightmap
-    int heightmapSize = 256;
-    Image heightmapImage = GeneratePerlinNoiseHeightmap(heightmapSize, heightmapSize, 5.0f, 6, 0.5f);
+    // FLAT TERRAIN WITH 20 CM INITIAL HEIGHT
+    int heightmapSize = 128;
+    float initialTerrainHeight = 0.2f; // 20 cm
+    float terrainWorldSize = 10.0f;
+    float terrainScale = terrainWorldSize / (float)heightmapSize;
+    
+    Image heightmapImage = GenImageColor(heightmapSize, heightmapSize, ::WHITE);
+    unsigned char hv = (unsigned char)((initialTerrainHeight / heightScale) * 255.0f);
+    ImageDrawRectangle(&heightmapImage, 0, 0, heightmapSize, heightmapSize, {hv, hv, hv, 255});
     Texture2D heightmapTexture = LoadTextureFromImage(heightmapImage);
     SetTextureFilter(heightmapTexture, TEXTURE_FILTER_BILINEAR);
     
-    // Create heightmap collision shape from the image
-    std::vector<float> heightSamples;
-    heightSamples.resize(heightmapSize * heightmapSize);
-    ::Color* pixels = LoadImageColors(heightmapImage);
+    std::vector<float> heightSamples(heightmapSize * heightmapSize, initialTerrainHeight);
     
-    for (int y = 0; y < heightmapSize; y++) {
-        for (int x = 0; x < heightmapSize; x++) {
-            // Convert grayscale to height (0-1 range scaled by heightScale)
-            float height = (pixels[y * heightmapSize + x].r / 255.0f) * heightScale;
-            heightSamples[y * heightmapSize + x] = height;
-        }
-    }
-    UnloadImageColors(pixels);
-    
-    // Create Jolt HeightFieldShape
-    float terrainScale = 20.0f / (float)heightmapSize; // Map to 20x20 world units
-    
-    // Initialize density cellular automata
-    DensityAutomata densityGrid(heightmapSize, terrainScale);
-    
-    // Initialize particle voxel grid for force calculations
-    // Grid covers -15 to 15 in X and Z, 0 to 5 in Y (where particles are active)
-    int voxelGridSizeXZ = 60;  // 30m / 0.5m cell size
-    int voxelGridSizeY = 10;   // 5m / 0.5m cell size
-    float voxelCellSize = 0.5f;
-    ParticleVoxelGrid particleVoxelGrid(voxelGridSizeXZ, voxelGridSizeY, voxelGridSizeXZ,
-                                         voxelCellSize,
-                                         -15.0f, 0.0f, -15.0f,   // min bounds
-                                         15.0f, 5.0f, 15.0f);    // max bounds
-    float lastParticleForce = 0.0f;  // For display purposes
-    Vector3 lastParticleForceVec = { 0.0f, 0.0f, 0.0f }; // Force vector from particles
-    
-    HeightFieldShapeSettings heightfield_settings(heightSamples.data(), Vec3(0, 0, 0), 
+    printf("DEBUG: Creating HeightFieldShape\n"); fflush(stdout);
+    HeightFieldShapeSettings hf_settings(heightSamples.data(), Vec3(0,0,0), 
         Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
-    ShapeSettings::ShapeResult heightfield_shape_result = heightfield_settings.Create();
-    ShapeRefC heightfield_shape = heightfield_shape_result.Get();
+    ShapeRefC hf_shape = hf_settings.Create().Get();
+    printf("DEBUG: HeightFieldShape created\n"); fflush(stdout);
     
-    // Create static body for heightmap
-    BodyCreationSettings heightmap_body_settings(heightfield_shape, 
-        RVec3(-10.0, 0.0, -10.0), // Position to center the heightmap
-        Quat::sIdentity(), 
-        EMotionType::Static, 
-        Layers::NON_MOVING);
-    heightmap_body_settings.mFriction = 50.0f; // High friction for terrain
-    Body* heightmap_body = body_interface.CreateBody(heightmap_body_settings);
+    float terrainOffset = -terrainWorldSize / 2.0f;
+    BodyCreationSettings hm_body_settings(hf_shape, RVec3(terrainOffset, 0.0, terrainOffset),
+        Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING);
+    hm_body_settings.mFriction = 0.8f;
+    Body* heightmap_body = body_interface.CreateBody(hm_body_settings);
     body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
-    
     UnloadImage(heightmapImage);
     
-    // Create plane mesh with high resolution for smooth heightmap displacement
-    Mesh planeMesh = GenMeshPlane(20.0f, 20.0f, 128, 128);
+    Mesh planeMesh = GenMeshPlane(terrainWorldSize, terrainWorldSize, 64, 64);
     Model planeModel = LoadModelFromMesh(planeMesh);
     planeModel.materials[0].shader = heightmapShader;
     planeModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = heightmapTexture;
     
-    // Create a sphere model for rendering
-    float sphereRadius = 0.1f;
-    float sphereDensity = 1500.0f; // kg/m³ (dirt/soil density)
-    float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
-    float sphereMass = sphereDensity * sphereVolume; // Mass of each sphere
-    Model sphereModel = LoadModelFromMesh(GenMeshSphere(sphereRadius, 32, 32));
+    DensityAutomata densityGrid(heightmapSize, terrainScale);
+    
+    // Sphere model for dirt particles
+    float sphereRadius = 0.03f;
+    float sphereDensity = 1800.0f;
+    float sphereVolume = (4.0f/3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
+    float sphereMass = sphereDensity * sphereVolume;
+    Model sphereModel = LoadModelFromMesh(GenMeshSphere(sphereRadius, 12, 12));
     sphereModel.materials[0].shader = shader;
     
-    // Create a cube model for the moving cube
-    // Define cube half-extents for each axis
-    float cubeHalfX = 1.0f;   // Half width (X)
-    float cubeHalfY = 0.5f;   // Half height (Y)
-    float cubeHalfZ = 0.1f;   // Half depth (Z)
-    Model cubeModel = LoadModelFromMesh(GenMeshCube(cubeHalfX * 2.0f, cubeHalfY * 2.0f, cubeHalfZ * 2.0f));
-    cubeModel.materials[0].shader = shader;
+    // BUCKET SCOOP
+    printf("DEBUG: Creating bucket shape\n"); fflush(stdout);
+    float bucketWidth = 0.6f, bucketDepth = 0.3f, bucketHeight = 0.2f, bucketWallThickness = 0.03f;
+    ShapeRefC bucket_shape = CreateBucketShape(bucketWidth, bucketDepth, bucketHeight, bucketWallThickness);
+    printf("DEBUG: Bucket shape created\n"); fflush(stdout);
+    Model bucketModel = CreateBucketModel(bucketWidth, bucketDepth, bucketHeight, bucketWallThickness, shader);
+    printf("DEBUG: Bucket model created\n"); fflush(stdout);
     
-    // Create physics body for the cube (kinematic so it can push spheres)
-    // BoxShapeSettings takes half-extents
-    BoxShapeSettings cube_shape_settings(Vec3(cubeHalfX, cubeHalfY, cubeHalfZ));
-    ShapeSettings::ShapeResult cube_shape_result = cube_shape_settings.Create();
-    ShapeRefC cube_shape = cube_shape_result.Get();
+    Vector3 bucketPosition = { -3.0f, 1.0f, 0.0f };
+    float bucketPitch = 0.0f, bucketYaw = 0.0f;
+    Quat bucketRotation = Quat::sRotation(Vec3(0,1,0), bucketYaw) * Quat::sRotation(Vec3(1,0,0), bucketPitch);
     
-    // 45 degree rotation around Y axis
-    Quat cubeRotation = Quat::sRotation(Vec3(0, 1, 0), 3.14159f / 4.0f);
+    BodyCreationSettings bucket_body_settings(bucket_shape, RVec3(bucketPosition.x, bucketPosition.y, bucketPosition.z),
+        bucketRotation, EMotionType::Kinematic, Layers::MOVING);
+    bucket_body_settings.mFriction = 0.8f;
+    bucket_body_settings.mRestitution = 0.1f;
+    Body* bucket_body = body_interface.CreateBody(bucket_body_settings);
+    BodyID bucket_body_id = bucket_body->GetID();
+    body_interface.AddBody(bucket_body_id, EActivation::Activate);
     
-    BodyCreationSettings cube_body_settings(cube_shape,
-        RVec3(-12.0f, 1.0f, 0.0f),
-        cubeRotation,
-        EMotionType::Kinematic,
-        Layers::MOVING);
-    cube_body_settings.mFriction = 0.5f;
-    cube_body_settings.mRestitution = 0.1f;
+    // ========================
+    // NEW: CLASS-BASED BLADE (for pushing/bulldozing terrain)
+    // ========================
+    printf("DEBUG: Creating Blade class\n"); fflush(stdout);
+    Blade blade(0.8f, 0.3f, 0.08f);  // Width, height, thickness
+    blade.SetPosition(Vector3{3.0f, 0.5f, 0.0f});
+    blade.SetShader(&shader);
+    blade.SetDriveMode(Blade::DriveMode::Manual);
+    blade.SetMaxSpeed(2.0f);
+    blade.SetEnginePower(300.0f);
+    blade.SetBladeRotation(30.0f);
+    blade.SetHeightOffset(0.05f);
+    printf("DEBUG: Initializing Blade physics\n"); fflush(stdout);
+    blade.Initialize(body_interface);
+    printf("DEBUG: Blade initialized\n"); fflush(stdout);
     
-    Body* cube_body = body_interface.CreateBody(cube_body_settings);
-    BodyID cube_body_id = cube_body->GetID();
-    body_interface.AddBody(cube_body_id, EActivation::Activate);
+    bool bladeActive = false;  // Toggle with 'B' key
     
-    // Moving cube properties
-    Vector3 cubePosition = { -12.0f, 1.0f, 0.0f }; // Start from left side
-    float cubeSpeed = 3.0f; // Units per second
-    float cubeCurrentSpeed = 3.0f; // Actual current speed (affected by resistance)
-    float cubeMinX = -12.0f;
-    float cubeMaxX = 12.0f;
-    float cubeDigDepth = 0.3f; // How deep the cube digs into terrain
-    float sphereSpawnAccumulator = 0.0f; // Accumulate displaced volume for spawning spheres
-    const float stoppedTimeThreshold = 0.5f; // Time in seconds before sphere converts to earth
+    // SCOOP STATE MACHINE
+    ScoopState currentState = ScoopState::IDLE;
+    float stateTimer = 0.0f;
     
-    // Terrain resistance physics
-    float cubeMass = 100.0f; // Mass of the cube in kg
-    float cubeEnginePower = 500.0f; // Engine force in Newtons
-    float terrainResistanceCoeff = 50.0f; // Resistance coefficient (force per unit volume displaced)
-    float lastTerrainForce = 0.0f; // For display purposes
+    Vector3 startPosition = { -3.0f, 1.0f, 0.0f };
+    Vector3 digPosition = { -1.5f, 0.0f, 0.0f };
+    Vector3 dropPosition = { 2.5f, 0.0f, 0.0f };
+    float liftHeight = 0.8f, digDepth = 0.08f;
+    float moveSpeed = 1.5f, liftSpeed = 0.8f, pitchSpeed = 1.2f;
     
-    // GUI settings for cube (applied on reset)
-    float guiCubeStartX = -12.0f;
-    float guiCubeStartZ = 0.0f;
-    float guiCubeSpeed = 3.0f;
-    float guiCubeHeight = 0.0f; // Height offset for cube Y position
-    float guiEnginePower = 500.0f; // Engine power setting
-    float guiResistanceCoeff = 50.0f; // Terrain resistance coefficient
+    bool autoScoop = false;
+    float scoopedVolume = 0.0f, targetPitch = 0.0f;
+    Vector3 targetPosition = startPosition;
+    
     bool showGui = true;
-    int activeSlider = -1; // Track which slider is being dragged
+    int activeSlider = -1;
+    float guiDigX = -1.5f, guiDigZ = 0.0f, guiDropX = 2.5f, guiDropZ = 0.0f;
+    float guiMoveSpeed = 1.5f, guiDigDepth = 0.08f;
+    float guiParticleDamping = 0.8f; // Higher = less rolling
     
-    // Circle mode settings
-    bool circleMode = false; // false = linear, true = circle
-    float guiCircleCenterX = 0.0f;
-    float guiCircleCenterZ = 0.0f;
-    float guiCircleRadius = 5.0f;
-    float guiBladeRotation = 45.0f; // Rotation angle in degrees
-    float circleAngle = 0.0f; // Current angle for circle movement
-    
-    // Manual drive mode settings
-    bool manualMode = false; // Manual arrow key control mode
-    int driveMode = 0; // 0 = linear, 1 = circle, 2 = manual
-    float manualRotation = 0.0f; // Current rotation in manual mode (radians)
-    Vector3 manualVelocity = { 0.0f, 0.0f, 0.0f }; // Current velocity in manual mode
-    float manualAcceleration = 10.0f; // Acceleration when pressing arrow keys
-    float manualDeceleration = 5.0f; // Deceleration when not pressing keys
-    float manualTurnSpeed = 2.0f; // Rotation speed in radians per second
-    
-    // Debug visualization settings
-    bool showVoxelDebug = false; // Toggle for voxel debug visualization
-
-    // List to hold dynamic spheres
     std::vector<PhysicsSphere> dynamicSpheres;
-
+    const float stoppedTimeThreshold = 1.0f;
+    
+    Model markerModel = LoadModelFromMesh(GenMeshCylinder(0.1f, 0.02f, 8));
+    
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
         UpdateOrbitalCamera(&camera, &cameraYaw, &cameraPitch, &cameraRadius, &previousMousePos);
-
-        // Mouse click to spawn sphere at clicked terrain point, 5m above
-        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            // Get mouse ray for raycasting
-            Ray ray = GetMouseRay(GetMousePosition(), camera);
-            
-            // Raycast against the terrain to find intersection point
-            Vector3 spawnPosition = { 0.0f, 5.0f, 0.0f }; // Default position
-            bool hitTerrain = false;
-            
-            // Sample along the ray to find terrain intersection
-            float maxDistance = 100.0f;
-            float step = 0.5f;
-            for (float dist = 0.0f; dist < maxDistance; dist += step) {
-                Vector3 testPoint = {
-                    ray.position.x + ray.direction.x * dist,
-                    ray.position.y + ray.direction.y * dist,
-                    ray.position.z + ray.direction.z * dist
-                };
-                
-                // Check if point is within terrain bounds
-                if (testPoint.x >= -10.0f && testPoint.x <= 10.0f &&
-                    testPoint.z >= -10.0f && testPoint.z <= 10.0f) {
-                    
-                    // Sample heightmap at this position
-                    float hmX = (testPoint.x + 10.0f) / (20.0f / heightmapSize);
-                    float hmZ = (testPoint.z + 10.0f) / (20.0f / heightmapSize);
-                    int ix = (int)hmX;
-                    int iz = (int)hmZ;
-                    
-                    if (ix >= 0 && ix < heightmapSize && iz >= 0 && iz < heightmapSize) {
-                        float terrainHeight = heightSamples[iz * heightmapSize + ix];
-                        
-                        // Check if ray point is below terrain surface
-                        if (testPoint.y <= terrainHeight) {
-                            spawnPosition = { testPoint.x, terrainHeight + 5.0f, testPoint.z };
-                            hitTerrain = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            // Create 10 spheres in a cluster
-            for (int i = 0; i < 10; i++) {
-                // Random offset within a small radius
-                float offsetX = ((float)GetRandomValue(-50, 50) / 100.0f);
-                float offsetY = ((float)GetRandomValue(0, 100) / 100.0f);
-                float offsetZ = ((float)GetRandomValue(-50, 50) / 100.0f);
-                
-                Vector3 sphereSpawnPos = {
-                    spawnPosition.x + offsetX,
-                    spawnPosition.y + offsetY,
-                    spawnPosition.z + offsetZ
-                };
-                
-                // Create sphere shape
-                SphereShapeSettings sphere_shape_settings(sphereRadius); // 0.5m radius
-                ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
-                ShapeRefC sphere_shape = sphere_shape_result.Get();
-                
-                // Create dynamic body for sphere at clicked position, 5m above terrain
-                BodyCreationSettings sphere_body_settings(sphere_shape,
-                    RVec3(sphereSpawnPos.x, sphereSpawnPos.y, sphereSpawnPos.z),
-                    Quat::sIdentity(),
-                    EMotionType::Dynamic,
-                    Layers::MOVING);
-                
-                // Set high friction and damping to reduce rolling (act like lumps)
-                sphere_body_settings.mFriction = 50.0f; // Almost sticky friction
-                sphere_body_settings.mRestitution = 0.05f; // Very low bounce
-                sphere_body_settings.mLinearDamping = 2.0f; // Very high linear damping
-                sphere_body_settings.mAngularDamping = 5.0f; // Extremely high angular damping to stop rolling
-                
-                Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
-                BodyID sphere_id = sphere_body->GetID();
-                body_interface.AddBody(sphere_id, EActivation::Activate);
-                
-                // Random color for the sphere // Greenish for dirt
-                ::Color sphereColor = {
-                    (unsigned char)0,
-                    (unsigned char)200,
-                    (unsigned char)0,
-                    255
-                };
-                
-                Vector3 initialVelocity = { 0.0f, 0.0f, 0.0f };
-                dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, spawnPosition, initialVelocity, sphereMass});
-            }
-        }
-
-        // Update physics (60 Hz simulation)
+        
         const float deltaTime = GetFrameTime();
-        const int collisionSteps = 1;
-        physics_system.Update(deltaTime, collisionSteps, &temp_allocator, &job_system);
+        stateTimer += deltaTime;
         
-        // Calculate terrain resistance force before moving
-        // This is done by looking ahead at what terrain we'll encounter
-        float terrainResistanceForce = 0.0f;
-        float cubeBottomY_preview = guiCubeHeight; // Bottom of cube (cubeHalfY + guiCubeHeight - cubeHalfY = guiCubeHeight)
+        digPosition.x = guiDigX; digPosition.z = guiDigZ;
+        dropPosition.x = guiDropX; dropPosition.z = guiDropZ;
+        moveSpeed = guiMoveSpeed; digDepth = guiDigDepth;
         
-        // Sample terrain ahead of the cube to calculate resistance
-        if (cubePosition.x >= -10.0f && cubePosition.x <= 10.0f &&
-            cubePosition.z >= -10.0f && cubePosition.z <= 10.0f) {
-            
-            float rotationRad;
-            if (driveMode == 2) {
-                rotationRad = manualRotation + guiBladeRotation * 3.14159f / 180.0f;
-            } else if (driveMode == 1) {
-                rotationRad = circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f;
-            } else {
-                rotationRad = guiBladeRotation * 3.14159f / 180.0f;
+        if (IsKeyPressed(KEY_SPACE)) {
+            autoScoop = !autoScoop;
+            if (autoScoop && currentState == ScoopState::IDLE) {
+                currentState = ScoopState::MOVING_TO_DIG;
+                stateTimer = 0.0f;
             }
-            float cosR = cosf(rotationRad);
-            float sinR = sinf(rotationRad);
-            
-            // Calculate the 4 corners of the rotated cube footprint
-            float previewCorners[4][2] = {
-                { cubeHalfX * cosR - cubeHalfZ * sinR,  cubeHalfX * sinR + cubeHalfZ * cosR},
-                {-cubeHalfX * cosR - cubeHalfZ * sinR, -cubeHalfX * sinR + cubeHalfZ * cosR},
-                { cubeHalfX * cosR + cubeHalfZ * sinR,  cubeHalfX * sinR - cubeHalfZ * cosR},
-                {-cubeHalfX * cosR + cubeHalfZ * sinR, -cubeHalfX * sinR - cubeHalfZ * cosR}
-            };
-            
-            float previewMinX = previewCorners[0][0], previewMaxX = previewCorners[0][0];
-            float previewMinZ = previewCorners[0][1], previewMaxZ = previewCorners[0][1];
-            for (int i = 1; i < 4; i++) {
-                if (previewCorners[i][0] < previewMinX) previewMinX = previewCorners[i][0];
-                if (previewCorners[i][0] > previewMaxX) previewMaxX = previewCorners[i][0];
-                if (previewCorners[i][1] < previewMinZ) previewMinZ = previewCorners[i][1];
-                if (previewCorners[i][1] > previewMaxZ) previewMaxZ = previewCorners[i][1];
-            }
-            
-            int hmMinX_p = (int)((cubePosition.x + previewMinX + 10.0f) / (20.0f / heightmapSize));
-            int hmMaxX_p = (int)((cubePosition.x + previewMaxX + 10.0f) / (20.0f / heightmapSize));
-            int hmMinZ_p = (int)((cubePosition.z + previewMinZ + 10.0f) / (20.0f / heightmapSize));
-            int hmMaxZ_p = (int)((cubePosition.z + previewMaxZ + 10.0f) / (20.0f / heightmapSize));
-            
-            // Calculate total penetration depth (represents displaced volume)
-            float totalPenetration = 0.0f;
-            int cellCount = 0;
-            for (int z = hmMinZ_p; z <= hmMaxZ_p; z++) {
-                for (int x = hmMinX_p; x <= hmMaxX_p; x++) {
-                    if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
-                        // Convert heightmap cell back to world coordinates
-                        float cellWorldX = (float)x * (20.0f / heightmapSize) - 10.0f;
-                        float cellWorldZ = (float)z * (20.0f / heightmapSize) - 10.0f;
-                        
-                        // Transform cell position to cube's local space (rotate by -rotationRad)
-                        float localX = (cellWorldX - cubePosition.x) * cosR + (cellWorldZ - cubePosition.z) * sinR;
-                        float localZ = -(cellWorldX - cubePosition.x) * sinR + (cellWorldZ - cubePosition.z) * cosR;
-                        
-                        // Check if point is inside the cube's footprint (in local space, it's axis-aligned)
-                        if (fabsf(localX) > cubeHalfX || fabsf(localZ) > cubeHalfZ) {
-                            continue; // Point is outside the rotated cube footprint
-                        }
-                        
-                        float terrainHeight = heightSamples[z * heightmapSize + x];
-                        if (cubeBottomY_preview < terrainHeight) {
-                            float penetration = terrainHeight - cubeBottomY_preview;
-                            totalPenetration += penetration;
-                            cellCount++;
-                        }
-                    }
+        }
+        
+        if (IsKeyPressed(KEY_ENTER) && !autoScoop && currentState == ScoopState::IDLE) {
+            currentState = ScoopState::MOVING_TO_DIG;
+            stateTimer = 0.0f;
+        }
+        
+        if (IsKeyPressed(KEY_R)) {
+            bucketPosition = startPosition;
+            bucketPitch = 0.0f;
+            currentState = ScoopState::IDLE;
+            autoScoop = false;
+            scoopedVolume = 0.0f;
+        }
+        
+        // STATE MACHINE
+        switch (currentState) {
+            case ScoopState::IDLE:
+                targetPosition = startPosition;
+                targetPitch = 0.0f;
+                break;
+                
+            case ScoopState::MOVING_TO_DIG:
+                targetPosition = { digPosition.x, liftHeight, digPosition.z };
+                targetPitch = -0.3f;
+                if (Vector3Distance(bucketPosition, targetPosition) < 0.1f) {
+                    currentState = ScoopState::DIGGING;
+                    stateTimer = 0.0f;
                 }
-            }
-            
-            // Calculate resistance force: F = coefficient * penetration_area * speed^2
-            // More penetration = more resistance, faster = more resistance (drag-like)
-            float cellArea = terrainScale * terrainScale;
-            float penetrationVolume = totalPenetration * cellArea;
-            // Scale up the resistance significantly - multiply by large factor to make it meaningful
-            // penetrationVolume is tiny because terrainScale is small (~0.078), so we need a big multiplier
-            terrainResistanceForce = guiResistanceCoeff * penetrationVolume * 1000.0f * (1.0f + cubeCurrentSpeed * cubeCurrentSpeed);
-        }
-        
-        lastTerrainForce = terrainResistanceForce;
-        
-        // Physics-based speed calculation
-        // Net force = Engine power - Terrain resistance
-        // Acceleration = Net force / Mass
-        float netForce = guiEnginePower - terrainResistanceForce;
-        float acceleration = netForce / cubeMass;
-        
-        // Update current speed based on acceleration
-        cubeCurrentSpeed += acceleration * deltaTime;
-        
-        // Clamp speed to reasonable bounds (can't go negative, can't exceed max)
-        float maxSpeed = guiCubeSpeed;
-        cubeCurrentSpeed = Clamp(cubeCurrentSpeed, 0.01f, maxSpeed); // Minimum speed to prevent stalling completely
-        
-        // If resistance exceeds engine power, apply stronger braking
-        if (terrainResistanceForce > guiEnginePower) {
-            float overloadRatio = terrainResistanceForce / guiEnginePower;
-            cubeCurrentSpeed *= (1.0f - 0.1f * fminf(overloadRatio - 1.0f, 5.0f) * deltaTime * 60.0f); // Scale braking with overload
-        }
-        
-        // Update moving cube position based on mode
-        if (driveMode == 2) {
-            // Manual mode: arrow key control
-            // Rotation with left/right arrows
-            if (IsKeyDown(KEY_LEFT)) {
-                manualRotation += manualTurnSpeed * deltaTime;
-            }
-            if (IsKeyDown(KEY_RIGHT)) {
-                manualRotation -= manualTurnSpeed * deltaTime;
-            }
-            
-            // Forward/backward acceleration with up/down arrows
-            float forwardInput = 0.0f;
-            if (IsKeyDown(KEY_UP)) {
-                forwardInput = 1.0f;
-            }
-            if (IsKeyDown(KEY_DOWN)) {
-                forwardInput = -0.5f; // Slower reverse
-            }
-            
-            // Calculate forward direction based on rotation
-            float forwardX = cosf(manualRotation);
-            float forwardZ = -sinf(manualRotation);
-            
-            if (forwardInput != 0.0f) {
-                // Accelerate in the forward direction
-                manualVelocity.x += forwardX * forwardInput * manualAcceleration * deltaTime;
-                manualVelocity.z += forwardZ * forwardInput * manualAcceleration * deltaTime;
-            } else {
-                // Decelerate when no input
-                float speed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
-                if (speed > 0.01f) {
-                    float decel = manualDeceleration * deltaTime;
-                    float newSpeed = fmaxf(0.0f, speed - decel);
-                    manualVelocity.x *= newSpeed / speed;
-                    manualVelocity.z *= newSpeed / speed;
-                } else {
-                    manualVelocity.x = 0.0f;
-                    manualVelocity.z = 0.0f;
-                }
-            }
-            
-            // Apply terrain resistance to manual velocity
-            float manualSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
-            if (manualSpeed > 0.01f && terrainResistanceForce > 0.0f) {
-                float resistanceDecel = (terrainResistanceForce / cubeMass) * deltaTime;
-                float newSpeed = fmaxf(0.0f, manualSpeed - resistanceDecel);
-                manualVelocity.x *= newSpeed / manualSpeed;
-                manualVelocity.z *= newSpeed / manualSpeed;
-            }
-            
-            // Clamp max speed
-            float maxManualSpeed = guiCubeSpeed;
-            manualSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
-            if (manualSpeed > maxManualSpeed) {
-                manualVelocity.x *= maxManualSpeed / manualSpeed;
-                manualVelocity.z *= maxManualSpeed / manualSpeed;
-            }
-            
-            // Update position
-            cubePosition.x += manualVelocity.x * deltaTime;
-            cubePosition.z += manualVelocity.z * deltaTime;
-            
-            // Update current speed for display
-            cubeCurrentSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
-            
-            // Update rotation
-            cubeRotation = Quat::sRotation(Vec3(0, 1, 0), manualRotation + guiBladeRotation * 3.14159f / 180.0f);
-        } else if (driveMode == 1) {
-            // Circle mode: rotate around center point
-            float angularSpeed = cubeCurrentSpeed / guiCircleRadius; // radians per second
-            circleAngle += angularSpeed * deltaTime;
-            if (circleAngle > 2.0f * 3.14159f) {
-                circleAngle -= 2.0f * 3.14159f;
-            }
-            
-            cubePosition.x = guiCircleCenterX + guiCircleRadius * cosf(circleAngle);
-            cubePosition.z = guiCircleCenterZ + guiCircleRadius * sinf(circleAngle);
-            
-            // Update cube rotation to be tangent to circle + blade rotation
-            float tangentAngle = circleAngle + 3.14159f / 2.0f; // Perpendicular to radius
-            float totalRotation = tangentAngle + guiBladeRotation * 3.14159f / 180.0f;
-            cubeRotation = Quat::sRotation(Vec3(0, 1, 0), totalRotation);
-        } else {
-            // Linear mode: move left to right
-            cubePosition.x += cubeCurrentSpeed * deltaTime;
-            if (cubePosition.x > cubeMaxX) {
-                // Reset cube with GUI values
-                cubePosition.x = guiCubeStartX;
-                cubePosition.z = guiCubeStartZ;
-                cubeCurrentSpeed = guiCubeSpeed; // Reset to base speed
-                cubeMinX = guiCubeStartX;
-            }
-            // Update rotation from GUI
-            cubeRotation = Quat::sRotation(Vec3(0, 1, 0), guiBladeRotation * 3.14159f / 180.0f);
-        }
-        
-        // Set cube Y position from height slider only (no terrain following)
-        cubePosition.y = cubeHalfY + guiCubeHeight;
-        
-        // Update cube physics body position and rotation (kinematic body)
-        body_interface.SetPositionAndRotation(cube_body_id, 
-            RVec3(cubePosition.x, cubePosition.y, cubePosition.z), 
-            cubeRotation, 
-            EActivation::Activate);
-        // Set velocity so physics engine knows it's moving (helps with collision response)
-        if (driveMode == 2) {
-            // Manual mode velocity
-            body_interface.SetLinearVelocity(cube_body_id, Vec3(manualVelocity.x, 0.0f, manualVelocity.z));
-        } else if (driveMode == 1) {
-            // Tangent velocity for circle motion
-            float vx = -cubeCurrentSpeed * sinf(circleAngle);
-            float vz = cubeCurrentSpeed * cosf(circleAngle);
-            body_interface.SetLinearVelocity(cube_body_id, Vec3(vx, 0.0f, vz));
-        } else {
-            body_interface.SetLinearVelocity(cube_body_id, Vec3(cubeCurrentSpeed, 0.0f, 0.0f));
-        }
-        
-        // Cube terrain deformation - dig into terrain and spawn spheres
-        // Only deform if cube is within terrain bounds AND low enough to touch terrain
-        float cubeBottomY = cubePosition.y - cubeHalfY; // Bottom of the cube
-        if (cubePosition.x >= -10.0f && cubePosition.x <= 10.0f &&
-            cubePosition.z >= -10.0f && cubePosition.z <= 10.0f &&
-            cubeBottomY < heightScale) { // Only dig if cube bottom is below max terrain height
-            
-            // Calculate rotated cube footprint - account for blade rotation
-            float rotationRad;
-            if (driveMode == 2) {
-                rotationRad = manualRotation + guiBladeRotation * 3.14159f / 180.0f;
-            } else if (driveMode == 1) {
-                rotationRad = circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f;
-            } else {
-                rotationRad = guiBladeRotation * 3.14159f / 180.0f;
-            }
-            float cosR = cosf(rotationRad);
-            float sinR = sinf(rotationRad);
-            
-            // Calculate the 4 corners of the rotated cube footprint
-            float corners[4][2] = {
-                { cubeHalfX * cosR - cubeHalfZ * sinR,  cubeHalfX * sinR + cubeHalfZ * cosR},
-                {-cubeHalfX * cosR - cubeHalfZ * sinR, -cubeHalfX * sinR + cubeHalfZ * cosR},
-                { cubeHalfX * cosR + cubeHalfZ * sinR,  cubeHalfX * sinR - cubeHalfZ * cosR},
-                {-cubeHalfX * cosR + cubeHalfZ * sinR, -cubeHalfX * sinR - cubeHalfZ * cosR}
-            };
-            
-            // Find axis-aligned bounding box of rotated footprint
-            float minX = corners[0][0], maxX = corners[0][0];
-            float minZ = corners[0][1], maxZ = corners[0][1];
-            for (int i = 1; i < 4; i++) {
-                if (corners[i][0] < minX) minX = corners[i][0];
-                if (corners[i][0] > maxX) maxX = corners[i][0];
-                if (corners[i][1] < minZ) minZ = corners[i][1];
-                if (corners[i][1] > maxZ) maxZ = corners[i][1];
-            }
-            
-            // Calculate cube footprint in heightmap coordinates using rotated bounds
-            int hmMinX = (int)((cubePosition.x + minX + 10.0f) / (20.0f / heightmapSize));
-            int hmMaxX = (int)((cubePosition.x + maxX + 10.0f) / (20.0f / heightmapSize));
-            int hmMinZ = (int)((cubePosition.z + minZ + 10.0f) / (20.0f / heightmapSize));
-            int hmMaxZ = (int)((cubePosition.z + maxZ + 10.0f) / (20.0f / heightmapSize));
-            
-            float totalDisplacedVolume = 0.0f;
-            std::vector<Vector3> dugTerrainPositions; // Store positions where digging occurred
-            
-            // Dig terrain under the cube - only if cube bottom is below terrain height at that point
-            for (int z = hmMinZ; z <= hmMaxZ; z++) {
-                for (int x = hmMinX; x <= hmMaxX; x++) {
-                    if (x >= 0 && x < heightmapSize && z >= 0 && z < heightmapSize) {
-                        // Convert heightmap cell back to world coordinates
-                        float cellWorldX = (float)x * (20.0f / heightmapSize) - 10.0f;
-                        float cellWorldZ = (float)z * (20.0f / heightmapSize) - 10.0f;
-                        
-                        // Transform cell position to cube's local space (rotate by -rotationRad)
-                        float localX = (cellWorldX - cubePosition.x) * cosR + (cellWorldZ - cubePosition.z) * sinR;
-                        float localZ = (cellWorldX - cubePosition.x) * sinR + (cellWorldZ - cubePosition.z) * cosR;
-                        
-                        // Check if point is inside the cube's footprint (in local space, it's axis-aligned)
-                        if (fabsf(localX) > cubeHalfX || fabsf(localZ) > cubeHalfZ) {
-                            continue; // Point is outside the rotated cube footprint
-                        }
-                        
-                        int idx = z * heightmapSize + x;
-                        float currentHeight = heightSamples[idx];
-                        
-                        // Only dig if cube bottom is below terrain at this point
-                        if (cubeBottomY < currentHeight && currentHeight > 0.0f) {
-                            float digAmount = cubeDigDepth * deltaTime * 5.0f; // Scale with frame time
-                            float actualDig = fminf(digAmount, currentHeight - cubeBottomY);
-                            actualDig = fminf(actualDig, currentHeight); // Don't go below 0
-                            if (actualDig > 0.0f) {
-                                // Store height before modification for accurate position
-                                float heightBeforeDig = currentHeight;
-                                
-                                heightSamples[idx] -= actualDig;
-                                if (heightSamples[idx] < 0.0f) heightSamples[idx] = 0.0f;
-                                
-                                // Store the terrain position where digging occurred (use height before dig)
-                                dugTerrainPositions.push_back({cellWorldX, heightBeforeDig, cellWorldZ});
-                                
-                                // Calculate displaced volume (per cell)
-                                float cellArea = terrainScale * terrainScale;
-                                totalDisplacedVolume += actualDig * cellArea;
+                break;
+                
+            case ScoopState::DIGGING: {
+                int hmX = (int)((digPosition.x + terrainWorldSize/2.0f) / terrainScale);
+                int hmZ = (int)((digPosition.z + terrainWorldSize/2.0f) / terrainScale);
+                hmX = Clamp(hmX, 0, heightmapSize - 1);
+                hmZ = Clamp(hmZ, 0, heightmapSize - 1);
+                float terrainHeight = heightSamples[hmZ * heightmapSize + hmX];
+                
+                targetPosition = { digPosition.x, terrainHeight - digDepth + bucketWallThickness, digPosition.z };
+                targetPitch = -0.5f;
+                
+                if (bucketPosition.y < terrainHeight + 0.05f) {
+                    int digRadiusH = (int)(bucketWidth / terrainScale / 2.0f) + 1;
+                    int digRadiusD = (int)(bucketDepth / terrainScale / 2.0f) + 1;
+                    
+                    for (int dz = -digRadiusD; dz <= digRadiusD; dz++) {
+                        for (int dx = -digRadiusH; dx <= digRadiusH; dx++) {
+                            int tx = hmX + dx, tz = hmZ + dz;
+                            if (tx >= 0 && tx < heightmapSize && tz >= 0 && tz < heightmapSize) {
+                                int idx = tz * heightmapSize + tx;
+                                float digAmt = digDepth * deltaTime * 2.0f;
+                                if (heightSamples[idx] > 0.0f) {
+                                    float actualDig = fminf(digAmt, heightSamples[idx]);
+                                    heightSamples[idx] -= actualDig;
+                                    scoopedVolume += actualDig * terrainScale * terrainScale;
+                                }
                             }
                         }
                     }
+                    
+                    while (scoopedVolume > sphereVolume * 3 && (int)dynamicSpheres.size() < maxSphereCount) {
+                        scoopedVolume -= sphereVolume;
+                        
+                        // Spawn in bucket's local space (inside the bucket)
+                        float localX = ((float)GetRandomValue(-30, 30) / 100.0f) * bucketWidth * 0.4f;
+                        float localY = bucketHeight * 0.3f + bucketWallThickness;  // Inside the bucket walls
+                        float localZ = ((float)GetRandomValue(-30, 30) / 100.0f) * bucketDepth * 0.3f;
+                        
+                        // Transform local position by bucket rotation (pitch around X axis)
+                        float cosPitch = cosf(bucketPitch);
+                        float sinPitch = sinf(bucketPitch);
+                        float rotatedY = localY * cosPitch - localZ * sinPitch;
+                        float rotatedZ = localY * sinPitch + localZ * cosPitch;
+                        
+                        // Final world position
+                        float spawnX = bucketPosition.x + localX;
+                        float spawnY = bucketPosition.y + rotatedY;
+                        float spawnZ = bucketPosition.z + rotatedZ;
+                        
+                        SphereShapeSettings sss(sphereRadius);
+                        ShapeRefC ss = sss.Create().Get();
+                        
+                        BodyCreationSettings sbs(ss, RVec3(spawnX, spawnY, spawnZ), Quat::sIdentity(),
+                            EMotionType::Dynamic, Layers::MOVING);
+                        sbs.mFriction = 0.95f;
+                        sbs.mRestitution = 0.02f;
+                        sbs.mLinearDamping = guiParticleDamping;
+                        sbs.mAngularDamping = guiParticleDamping * 1.5f;
+                        
+                        Body* sb = body_interface.CreateBody(sbs);
+                        if (sb) {
+                            BodyID sid = sb->GetID();
+                            body_interface.AddBody(sid, EActivation::Activate);
+                            dynamicSpheres.push_back({sid, {139, 90, 43, 255}, 0.0f, false, 
+                                {spawnX, spawnY, spawnZ}, {0,0,0}, sphereMass});
+                        }
+                    }
                 }
-            }
-            
-            // Accumulate displaced volume and spawn spheres
-            sphereSpawnAccumulator += totalDisplacedVolume;
-            const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
-            
-            // Limit sphere spawning if we have too many
-            while (sphereSpawnAccumulator >= sphereVolume && (int)dynamicSpheres.size() < maxSphereCount) {
-                sphereSpawnAccumulator -= sphereVolume;
                 
-                // Spawn sphere at a random dug terrain location
-                Vector3 sphereSpawnPos;
-                if (!dugTerrainPositions.empty()) {
-                    // Pick a random dug terrain position
-                    int randomIdx = GetRandomValue(0, (int)dugTerrainPositions.size() - 1);
-                    Vector3 terrainPos = dugTerrainPositions[randomIdx];
-                    
-                    // Spawn at terrain location with slight offset above
-                    sphereSpawnPos = {
-                        terrainPos.x,
-                        terrainPos.y + sphereRadius + 0.2f,
-                        terrainPos.z
-                    };
-                } else {
-                    // Fallback: spawn near cube position
-                    float spawnOffsetX = cubeHalfX + sphereRadius + 0.15f;
-                    float spawnOffsetZ = ((float)GetRandomValue(-50, 50) / 100.0f) * cubeHalfZ;
-                    float spawnY = cubePosition.y - cubeHalfY + sphereRadius;
-                    
-                    sphereSpawnPos = {
-                        cubePosition.x + spawnOffsetX,
-                        spawnY + 0.3f,
-                        cubePosition.z + spawnOffsetZ
-                    };
+                if (bucketPosition.y <= targetPosition.y + 0.02f && stateTimer > 0.5f) {
+                    currentState = ScoopState::LIFTING;
+                    stateTimer = 0.0f;
                 }
+            } break;
                 
-                // Create sphere shape
-                SphereShapeSettings sphere_shape_settings(sphereRadius);
-                ShapeSettings::ShapeResult sphere_shape_result = sphere_shape_settings.Create();
-                ShapeRefC sphere_shape = sphere_shape_result.Get();
+            case ScoopState::LIFTING:
+                targetPosition = { digPosition.x, liftHeight, digPosition.z };
+                targetPitch = -0.6f;
+                if (bucketPosition.y >= liftHeight - 0.05f) {
+                    currentState = ScoopState::MOVING_TO_DROP;
+                    stateTimer = 0.0f;
+                }
+                break;
                 
-                // Create dynamic body for sphere
-                BodyCreationSettings sphere_body_settings(sphere_shape,
-                    RVec3(sphereSpawnPos.x, sphereSpawnPos.y, sphereSpawnPos.z),
-                    Quat::sIdentity(),
-                    EMotionType::Dynamic,
-                    Layers::MOVING);
+            case ScoopState::MOVING_TO_DROP:
+                targetPosition = { dropPosition.x, liftHeight, dropPosition.z };
+                targetPitch = -0.6f;
+                if (Vector3Distance(bucketPosition, targetPosition) < 0.1f) {
+                    currentState = ScoopState::DROPPING;
+                    stateTimer = 0.0f;
+                }
+                break;
                 
-                sphere_body_settings.mFriction = 50.0f;
-                sphere_body_settings.mRestitution = 0.05f;
-                sphere_body_settings.mLinearDamping = 2.0f;
-                sphere_body_settings.mAngularDamping = 5.0f;
+            case ScoopState::DROPPING:
+                targetPitch = 0.8f;
+                if (stateTimer > 1.5f) {
+                    currentState = ScoopState::RETURNING;
+                    stateTimer = 0.0f;
+                }
+                break;
                 
-                Body* sphere_body = body_interface.CreateBody(sphere_body_settings);
-                if (sphere_body != nullptr) {
-                    BodyID sphere_id = sphere_body->GetID();
-                    body_interface.AddBody(sphere_id, EActivation::Activate);
-                    
-                    // No initial velocity - cube will push the spheres
-                    
-                    ::Color sphereColor = {
-                        (unsigned char)139,
-                        (unsigned char)90,
-                        (unsigned char)43,
-                        255
-                    }; // Brown dirt color
-                    
-                    Vector3 initialVelocity = { 0.0f, 0.0f, 0.0f };
-                    dynamicSpheres.push_back({sphere_id, sphereColor, 0.0f, false, sphereSpawnPos, initialVelocity, sphereMass});
+            case ScoopState::RETURNING:
+                targetPosition = startPosition;
+                targetPitch = 0.0f;
+                if (Vector3Distance(bucketPosition, targetPosition) < 0.1f && fabsf(bucketPitch) < 0.1f) {
+                    currentState = ScoopState::IDLE;
+                    if (autoScoop) currentState = ScoopState::MOVING_TO_DIG;
+                    stateTimer = 0.0f;
+                }
+                break;
+        }
+        
+        // Smooth movement
+        Vector3 toTarget = Vector3Subtract(targetPosition, bucketPosition);
+        float dist = Vector3Length(toTarget);
+        if (dist > 0.01f) {
+            float moveAmt = fminf(moveSpeed * deltaTime, dist);
+            bucketPosition = Vector3Add(bucketPosition, Vector3Scale(toTarget, moveAmt / dist));
+        }
+        
+        float pitchDiff = targetPitch - bucketPitch;
+        if (fabsf(pitchDiff) > 0.01f) {
+            float pitchAmt = pitchSpeed * deltaTime;
+            bucketPitch += (fabsf(pitchDiff) < pitchAmt) ? pitchDiff : (pitchDiff > 0 ? pitchAmt : -pitchAmt);
+        }
+        
+        bucketRotation = Quat::sRotation(Vec3(0,1,0), bucketYaw) * Quat::sRotation(Vec3(1,0,0), bucketPitch);
+        
+        // Use MoveKinematic instead of SetPositionAndRotation for proper collision with dynamic bodies
+        body_interface.MoveKinematic(bucket_body_id,
+            RVec3(bucketPosition.x, bucketPosition.y, bucketPosition.z), bucketRotation, deltaTime);
+        
+        // ========================
+        // NEW: Update blade if active
+        // ========================
+        if (IsKeyPressed(KEY_B)) bladeActive = !bladeActive;
+        
+        if (bladeActive) {
+            // Handle blade manual input
+            blade.HandleManualInput(deltaTime, 
+                IsKeyDown(KEY_I),  // Forward
+                IsKeyDown(KEY_K),  // Backward
+                IsKeyDown(KEY_J),  // Turn left
+                IsKeyDown(KEY_L)); // Turn right
+            
+            // Create dummy particle voxel grid (blade doesn't use it in simple mode)
+            ParticleVoxelGrid dummyGrid(1, 1, 1, 1.0f, 0, 0, 0, 1, 1, 1);
+            
+            // Update blade
+            blade.Update(deltaTime, body_interface, heightSamples, heightmapSize,
+                        terrainScale, heightScale, densityGrid, dummyGrid);
+            
+            // Dig terrain with blade
+            std::vector<Vector3> dugPositions;
+            float displacedVolume = blade.DigTerrain(heightSamples, heightmapSize, 
+                                                      terrainScale, heightScale, deltaTime, dugPositions);
+            
+            // Spawn spheres from displaced terrain
+            while (displacedVolume > sphereVolume * 2 && (int)dynamicSpheres.size() < maxSphereCount) {
+                displacedVolume -= sphereVolume;
+                
+                Vector3 bladePos = blade.GetPosition();
+                float spawnX = bladePos.x + ((float)GetRandomValue(-30, 30) / 100.0f) * 0.4f;
+                float spawnY = bladePos.y + 0.1f;
+                float spawnZ = bladePos.z + ((float)GetRandomValue(-30, 30) / 100.0f) * 0.4f;
+                
+                SphereShapeSettings sss(sphereRadius);
+                ShapeRefC ss = sss.Create().Get();
+                
+                BodyCreationSettings sbs(ss, RVec3(spawnX, spawnY, spawnZ), Quat::sIdentity(),
+                    EMotionType::Dynamic, Layers::MOVING);
+                sbs.mFriction = 0.9f;
+                sbs.mRestitution = 0.05f;
+                sbs.mLinearDamping = 0.5f;
+                sbs.mAngularDamping = 0.5f;
+                
+                Body* sb = body_interface.CreateBody(sbs);
+                if (sb) {
+                    BodyID sid = sb->GetID();
+                    body_interface.AddBody(sid, EActivation::Activate);
+                    dynamicSpheres.push_back({sid, {139, 90, 43, 255}, 0.0f, false, 
+                        {spawnX, spawnY, spawnZ}, {0,0,0}, sphereMass});
                 }
             }
         }
         
-        // Update density cellular automata
-        densityGrid.Update(deltaTime, heightSamples, heightScale);
+        physics_system.Update(deltaTime, 1, &temp_allocator, &job_system);
         
-        // If too many spheres, force-convert the oldest stopped ones to terrain
-        if ((int)dynamicSpheres.size() > maxSphereCount - 20) {
-            // Find spheres that have been stopped for any amount of time and convert them
-            int converted = 0;
-            for (auto& sphere : dynamicSpheres) {
-                if (sphere.markedForDestruction) continue;
-                if (sphere.stoppedTimer > 0.1f && converted < 20) {
-                    // Force convert to terrain
-                    RVec3 pos = body_interface.GetPosition(sphere.bodyID);
-                    float worldX = (float)pos.GetX();
-                    float worldZ = (float)pos.GetZ();
-                    
-                    const float sphereVol = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
-                    float densityAmt = sphereVol * 250.0f;
-                    ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
-                                  1.0f, densityAmt, 0.15f, terrainScale, heightmapSize);
-                    sphere.markedForDestruction = true;
-                    converted++;
-                }
-            }
-        }
-        
-        // Check for spheres touching terrain and track stopped time
-        bool densityAdded = false;
-        
-        // Clear particle voxel grid for fresh update
-        particleVoxelGrid.Clear();
-        
+        // Update spheres
         for (auto& sphere : dynamicSpheres) {
             if (sphere.markedForDestruction) continue;
             
-            RVec3 position = body_interface.GetPosition(sphere.bodyID);
-            Vec3 joltVel = body_interface.GetLinearVelocity(sphere.bodyID);
-            float worldX = (float)position.GetX();
-            float worldY = (float)position.GetY();
-            float worldZ = (float)position.GetZ();
-            Vector3 currentPos = { worldX, worldY, worldZ };
+            RVec3 pos = body_interface.GetPosition(sphere.bodyID);
+            Vec3 vel = body_interface.GetLinearVelocity(sphere.bodyID);
+            Vector3 currentPos = { (float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ() };
             
-            // Update sphere velocity from physics engine
-            sphere.velocity = { joltVel.GetX(), joltVel.GetY(), joltVel.GetZ() };
+            float speed = sqrtf(vel.GetX()*vel.GetX() + vel.GetY()*vel.GetY() + vel.GetZ()*vel.GetZ());
+            if (speed < 0.05f && currentPos.y < 0.5f) sphere.stoppedTimer += deltaTime;
+            else sphere.stoppedTimer = 0.0f;
             
-            // Add this sphere to the particle voxel grid
-            particleVoxelGrid.AddParticle(worldX, worldY, worldZ, sphere.mass, sphere.velocity);
-            
-            // Check if sphere is touching or near the ground
-            float terrainHeight = 0.0f;
-            float hmX = (worldX + 10.0f) / (20.0f / heightmapSize);
-            float hmZ = (worldZ + 10.0f) / (20.0f / heightmapSize);
-            int ix = (int)hmX;
-            int iz = (int)hmZ;
-            
-            if (ix >= 0 && ix < heightmapSize && iz >= 0 && iz < heightmapSize) {
-                terrainHeight = heightSamples[iz * heightmapSize + ix];
-            }
-            
-            // Check if sphere is on or near terrain
-            bool onTerrain = (worldY - sphereRadius <= terrainHeight + 0.15f);
-            
-            // Check if sphere has stopped moving
-            if (onTerrain && IsSphereStationary(currentPos, sphere.lastPosition, 0.02f)) {
-                sphere.stoppedTimer += deltaTime;
-            } else {
-                sphere.stoppedTimer = 0.0f; // Reset timer if moving
-            }
-            
-            // Update last position
-            sphere.lastPosition = currentPos;
-            
-            // If sphere has been stopped long enough, convert to terrain
-            if (sphere.stoppedTimer >= stoppedTimeThreshold) {
-                // Add density to cellular automata grid
-                const float sphereVolume = (4.0f / 3.0f) * 3.14159f * sphereRadius * sphereRadius * sphereRadius;
-                
-                // Convert sphere to terrain height
-                // Use smaller radius to concentrate material and higher multiplier to account for density->height conversion
-                float densityAmount = sphereVolume * 250.0f;
-                ModifyHeightmapWithDensity(densityGrid, worldX, worldZ, 
-                              1.0f, densityAmount, 0.15f, terrainScale, heightmapSize);
-                densityAdded = true;
-                sphere.markedForDestruction = true;
-            }
-            
-            // Also destroy spheres that fall off the terrain
-            if (worldY < -5.0f || worldX < -15.0f || worldX > 15.0f || 
-                worldZ < -15.0f || worldZ > 15.0f) {
-                sphere.markedForDestruction = true;
-            }
-        }
-        
-        // Calculate particle forces against the blade using voxel grid
-        {
-            float rotationRad;
-            if (driveMode == 2) {
-                rotationRad = manualRotation + guiBladeRotation * 3.14159f / 180.0f;
-            } else if (driveMode == 1) {
-                rotationRad = circleAngle + 3.14159f / 2.0f + guiBladeRotation * 3.14159f / 180.0f;
-            } else {
-                rotationRad = guiBladeRotation * 3.14159f / 180.0f;
-            }
-            
-            lastParticleForceVec = particleVoxelGrid.CalculateBladeForce(
-                cubePosition, cubeHalfX, cubeHalfY, cubeHalfZ,
-                rotationRad, deltaTime);
-            
-            // Calculate magnitude of particle force
-            lastParticleForce = sqrtf(lastParticleForceVec.x * lastParticleForceVec.x + 
-                                      lastParticleForceVec.y * lastParticleForceVec.y + 
-                                      lastParticleForceVec.z * lastParticleForceVec.z);
-            
-            // Add particle force to terrain resistance for speed calculation
-            // This makes pushing particles slow down the blade
-            terrainResistanceForce += lastParticleForce;
-        }
-        
-        // Recreate physics body periodically to match CA updates (every few frames)
-        static int frameCounter = 0;
-        frameCounter++;
-        bool shouldUpdatePhysics = densityAdded || (frameCounter % 10 == 0); // Update every 10 frames
-        
-        if (shouldUpdatePhysics) {
-            // Remove old heightmap body
-            body_interface.RemoveBody(heightmap_body->GetID());
-            body_interface.DestroyBody(heightmap_body->GetID());
-            
-            // Create new heightfield shape with updated heights
-            HeightFieldShapeSettings new_heightfield_settings(heightSamples.data(), Vec3(0, 0, 0), 
-                Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
-            ShapeSettings::ShapeResult new_heightfield_shape_result = new_heightfield_settings.Create();
-            ShapeRefC new_heightfield_shape = new_heightfield_shape_result.Get();
-            
-            // Create new static body for heightmap
-            BodyCreationSettings new_heightmap_body_settings(new_heightfield_shape, 
-                RVec3(-10.0, 0.0, -10.0),
-                Quat::sIdentity(), 
-                EMotionType::Static, 
-                Layers::NON_MOVING);
-            new_heightmap_body_settings.mFriction = 5.0f; // High friction for terrain
-            heightmap_body = body_interface.CreateBody(new_heightmap_body_settings);
-            body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
-            
-            // Update visual heightmap texture
-            ::Color* newPixels = (::Color*)RL_MALLOC(heightmapSize * heightmapSize * sizeof(::Color));
-            for (int y = 0; y < heightmapSize; y++) {
-                for (int x = 0; x < heightmapSize; x++) {
-                    unsigned char value = (unsigned char)((heightSamples[y * heightmapSize + x] / heightScale) * 255.0f);
-                    newPixels[y * heightmapSize + x] = ::Color{ value, value, value, 255 };
+            if (sphere.stoppedTimer > stoppedTimeThreshold) {
+                int hmX = (int)((currentPos.x + terrainWorldSize/2.0f) / terrainScale);
+                int hmZ = (int)((currentPos.z + terrainWorldSize/2.0f) / terrainScale);
+                if (hmX >= 0 && hmX < heightmapSize && hmZ >= 0 && hmZ < heightmapSize) {
+                    heightSamples[hmZ * heightmapSize + hmX] += sphereVolume / (terrainScale * terrainScale) * 0.5f;
                 }
+                sphere.markedForDestruction = true;
             }
-            UpdateTexture(heightmapTexture, newPixels);
-            RL_FREE(newPixels);
+            
+            if (currentPos.y < -2.0f || fabsf(currentPos.x) > 8.0f || fabsf(currentPos.z) > 8.0f)
+                sphere.markedForDestruction = true;
+            
+            sphere.lastPosition = currentPos;
         }
         
-        // Remove and destroy marked spheres
         for (auto it = dynamicSpheres.begin(); it != dynamicSpheres.end(); ) {
             if (it->markedForDestruction) {
                 body_interface.RemoveBody(it->bodyID);
                 body_interface.DestroyBody(it->bodyID);
                 it = dynamicSpheres.erase(it);
-            } else {
-                ++it;
-            }
+            } else ++it;
         }
-
-        // Rotate light direction around a circle
-        float lightSpeed = 0.0f;
-        lightAngle += lightSpeed * GetFrameTime();
-        lightDirection.x = cosf(lightAngle);
-        lightDirection.z = sinf(lightAngle);
-        lightDirection.y = -0.5f;
-        lightDirection = Vector3Normalize(lightDirection);
-        SetShaderValue(shader, lightDirLoc, &lightDirection, SHADER_UNIFORM_VEC3);
-
-        // Update camera position in shader
-        SetShaderValue(shader, viewPosLoc, &camera.position, SHADER_UNIFORM_VEC3);
         
-        // Update heightmap shader
-        SetShaderValue(heightmapShader, hm_lightDirLoc, &lightDirection, SHADER_UNIFORM_VEC3);
+        // Update heightmap physics periodically
+        static int frameCounter = 0;
+        if (++frameCounter % 30 == 0) {
+            body_interface.RemoveBody(heightmap_body->GetID());
+            body_interface.DestroyBody(heightmap_body->GetID());
+            
+            HeightFieldShapeSettings new_hf(heightSamples.data(), Vec3(0,0,0), 
+                Vec3(terrainScale, 1.0f, terrainScale), heightmapSize);
+            ShapeRefC new_shape = new_hf.Create().Get();
+            
+            BodyCreationSettings new_hm(new_shape, RVec3(terrainOffset, 0.0, terrainOffset),
+                Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING);
+            new_hm.mFriction = 0.8f;
+            heightmap_body = body_interface.CreateBody(new_hm);
+            body_interface.AddBody(heightmap_body->GetID(), EActivation::DontActivate);
+            
+            ::Color* newPixels = (::Color*)RL_MALLOC(heightmapSize * heightmapSize * sizeof(::Color));
+            for (int i = 0; i < heightmapSize * heightmapSize; i++) {
+                unsigned char val = (unsigned char)Clamp(heightSamples[i] / heightScale * 255.0f, 0.0f, 255.0f);
+                newPixels[i] = { val, val, val, 255 };
+            }
+            UpdateTexture(heightmapTexture, newPixels);
+            RL_FREE(newPixels);
+        }
+        
+        SetShaderValue(shader, viewPosLoc, &camera.position, SHADER_UNIFORM_VEC3);
         SetShaderValue(heightmapShader, hm_viewPosLoc, &camera.position, SHADER_UNIFORM_VEC3);
-
+        
+        // RENDERING
         BeginDrawing();
-        ClearBackground(::GRAY);
+        ClearBackground(::SKYBLUE);
 
         BeginMode3D(camera);
-        //DrawGrid(20, 1.0f);
         
-        // Draw the heightmap plane at the origin
-        DrawModel(planeModel, Vector3{ 0.0f, 0.0f, 0.0f }, 1.0f, ::WHITE);
+        DrawModel(planeModel, Vector3{ 0.0f, 0.0f, 0.0f }, 1.0f, ::BROWN);
+        DrawGrid(20, 0.5f);
         
-        // Draw all dynamic spheres
+        float bucketPitchDeg = bucketPitch * 180.0f / 3.14159f;
+        DrawModelEx(bucketModel, bucketPosition, Vector3{1,0,0}, bucketPitchDeg, Vector3{1,1,1}, ::ORANGE);
+        
+        // Draw blade if active
+        if (bladeActive) {
+            blade.Draw();
+        }
+        
         for (const auto& sphere : dynamicSpheres) {
-            RVec3 position = body_interface.GetPosition(sphere.bodyID);
-            Vector3 spherePos = { (float)position.GetX(), (float)position.GetY(), (float)position.GetZ() };
-            DrawModel(sphereModel, spherePos, 1.0f, sphere.color);
+            RVec3 pos = body_interface.GetPosition(sphere.bodyID);
+            DrawModel(sphereModel, {(float)pos.GetX(), (float)pos.GetY(), (float)pos.GetZ()}, 1.0f, sphere.color);
         }
         
-        // Draw the moving cube with rotation from GUI
-        float visualRotation;
-        if (driveMode == 2) {
-            visualRotation = manualRotation * 180.0f / 3.14159f + guiBladeRotation;
-        } else if (driveMode == 1) {
-            visualRotation = circleAngle * 180.0f / 3.14159f + 90.0f + guiBladeRotation;
-        } else {
-            visualRotation = guiBladeRotation;
-        }
-        DrawModelEx(cubeModel, cubePosition, Vector3{0.0f, 1.0f, 0.0f}, visualRotation, Vector3{1.0f, 1.0f, 1.0f}, ::BLUE);
+        DrawModel(markerModel, Vector3{digPosition.x, 0.5f, digPosition.z}, 1.0f, ::RED);
+        DrawCylinderWires(Vector3{digPosition.x, 0.0f, digPosition.z}, bucketWidth/2, bucketWidth/2, 0.01f, 16, ::RED);
         
-        // Draw voxel debug visualization
-        if (showVoxelDebug) {
-            particleVoxelGrid.DrawDebug();
-        }
+        DrawModel(markerModel, Vector3{dropPosition.x, 0.5f, dropPosition.z}, 1.0f, ::GREEN);
+        DrawCylinderWires(Vector3{dropPosition.x, 0.0f, dropPosition.z}, bucketWidth/2, bucketWidth/2, 0.01f, 16, ::GREEN);
         
         EndMode3D();
 
-        DrawText("Right-click to drop 10 spheres from 5m high", 10, 10, 20, ::DARKGRAY);
-        DrawText(TextFormat("Sphere Count: %d", (int)dynamicSpheres.size()), 10, 35, 16, ::DARKGRAY);
-        DrawText(TextFormat("Sphere Radius: %.2fm", sphereRadius), 10, 55, 16, ::DARKGRAY);
-        float speedPercent = (guiCubeSpeed > 0) ? (cubeCurrentSpeed / guiCubeSpeed * 100.0f) : 0.0f;
-        DrawText(TextFormat("Speed: %.2f / %.2f m/s (%.0f%%)", cubeCurrentSpeed, guiCubeSpeed, speedPercent), 10, 75, 16, 
-                 speedPercent < 50.0f ? ::RED : ::DARKGRAY);
-        float totalForce = lastTerrainForce + lastParticleForce;
-        DrawText(TextFormat("Total Force: %.0f N (Terrain: %.0f + Particle: %.0f)", totalForce, lastTerrainForce, lastParticleForce), 
-                 10, 95, 16, totalForce > guiEnginePower ? ::RED : ::DARKGRAY);
-        DrawText(TextFormat("Engine: %.0f N | Voxels: %d", guiEnginePower, particleVoxelGrid.GetTotalParticleCount()), 
-                 10, 115, 16, ::DARKGRAY);
-        DrawFPS(10, 135);
+        // GUI
+        DrawText("TERRAIN SCOOP SIMULATION", 10, 10, 24, ::DARKGRAY);
+        DrawText(TextFormat("State: %s", GetStateName(currentState)), 10, 40, 20, ::BLUE);
+        DrawText(TextFormat("Spheres: %d / %d", (int)dynamicSpheres.size(), maxSphereCount), 10, 65, 16, ::DARKGRAY);
+        DrawText(TextFormat("Auto: %s", autoScoop ? "ON" : "OFF"), 10, 85, 16, autoScoop ? ::GREEN : ::RED);
         
-        // Toggle GUI with G key, toggle voxel debug with V key
+        DrawText("Controls:", 10, 115, 16, ::DARKGRAY);
+        DrawText("SPACE - Toggle auto scoop", 10, 135, 14, ::GRAY);
+        DrawText("ENTER - Single step", 10, 150, 14, ::GRAY);
+        DrawText("R - Reset", 10, 165, 14, ::GRAY);
+        DrawText("G - Toggle GUI", 10, 180, 14, ::GRAY);
+        DrawText("B - Toggle Blade", 10, 195, 14, ::GRAY);
+        
+        if (bladeActive) {
+            DrawText("Blade ON - Use I/K/J/L to drive", 10, 215, 14, ::BLUE);
+            Vector3 bladePos = blade.GetPosition();
+            DrawText(TextFormat("Blade: (%.1f, %.1f) Speed: %.2f", bladePos.x, bladePos.z, blade.GetCurrentSpeed()), 
+                     10, 235, 14, ::BLUE);
+        }
+        
         if (IsKeyPressed(KEY_G)) showGui = !showGui;
-        if (IsKeyPressed(KEY_V)) showVoxelDebug = !showVoxelDebug;
         
-        // Draw GUI panel for cube settings
         if (showGui) {
-            int panelX = 10;
-            int panelY = 160;
-            int panelW = 220;
-            int panelH = (driveMode == 1) ? 335 : ((driveMode == 2) ? 200 : 275);
+            int panelX = GetScreenWidth() - 240, panelY = 10, panelW = 230, panelH = 220;
             
             DrawRectangle(panelX, panelY, panelW, panelH, Fade(::LIGHTGRAY, 0.9f));
             DrawRectangleLines(panelX, panelY, panelW, panelH, ::DARKGRAY);
-            DrawText("Cube Settings", panelX + 5, panelY + 5, 10, ::DARKGRAY);
+            DrawText("Settings", panelX + 5, panelY + 5, 14, ::DARKGRAY);
             
             Vector2 mousePos = GetMousePosition();
             bool mouseDown = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
             bool mousePressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
             bool mouseReleased = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
             
-            // Mode toggle button
-            {
-                int btnX = panelX + 5;
-                int btnY = panelY + 22;
-                int btnW = 100;
-                int btnH = 18;
-                Rectangle btnRect = { (float)btnX, (float)btnY, (float)btnW, (float)btnH };
-                
-                ::Color btnColor = (driveMode == 0) ? ::MAROON : ((driveMode == 1) ? ::GREEN : ::ORANGE);
-                const char* modeText = (driveMode == 0) ? "Linear" : ((driveMode == 1) ? "Circle" : "Manual");
-                DrawRectangle(btnX, btnY, btnW, btnH, btnColor);
-                DrawRectangleLines(btnX, btnY, btnW, btnH, ::DARKGRAY);
-                DrawText(modeText, btnX + 25, btnY + 4, 10, ::WHITE);
-                
-                if (CheckCollisionPointRec(mousePos, btnRect) && mousePressed) {
-                    driveMode = (driveMode + 1) % 3; // Cycle through 0, 1, 2
-                    if (driveMode == 1) {
-                        // Initialize circle position
-                        circleAngle = 0.0f;
-                        cubePosition.x = guiCircleCenterX + guiCircleRadius;
-                        cubePosition.z = guiCircleCenterZ;
-                    } else if (driveMode == 2) {
-                        // Initialize manual mode
-                        manualVelocity = { 0.0f, 0.0f, 0.0f };
-                        manualRotation = 0.0f;
-                    }
-                }
-            }
+            auto drawSlider = [&](const char* label, float& val, float minV, float maxV, int y, ::Color c, int id) {
+                int sliderX = panelX + 70, sliderW = 120, sliderH = 14;
+                DrawText(label, panelX + 5, y, 12, ::DARKGRAY);
+                DrawRectangle(sliderX, y, sliderW, sliderH, ::DARKGRAY);
+                float norm = (val - minV) / (maxV - minV);
+                DrawRectangle(sliderX + (int)(norm * (sliderW - 8)), y, 8, sliderH, c);
+                Rectangle rect = { (float)sliderX, (float)y, (float)sliderW, (float)sliderH };
+                if (CheckCollisionPointRec(mousePos, rect) && mousePressed) activeSlider = id;
+                if (activeSlider == id && mouseDown)
+                    val = minV + Clamp((mousePos.x - sliderX) / sliderW, 0.0f, 1.0f) * (maxV - minV);
+                DrawText(TextFormat("%.1f", val), sliderX + sliderW + 5, y, 12, ::BLACK);
+            };
             
-            int sliderStartY = panelY + 45;
+            drawSlider("Dig X:", guiDigX, -4.0f, 4.0f, panelY + 30, ::RED, 0);
+            drawSlider("Dig Z:", guiDigZ, -4.0f, 4.0f, panelY + 55, ::RED, 1);
+            drawSlider("Drop X:", guiDropX, -4.0f, 4.0f, panelY + 80, ::GREEN, 2);
+            drawSlider("Drop Z:", guiDropZ, -4.0f, 4.0f, panelY + 105, ::GREEN, 3);
+            drawSlider("Speed:", guiMoveSpeed, 0.5f, 4.0f, panelY + 130, ::BLUE, 4);
             
-            if (driveMode == 0) {
-                // Linear mode sliders
-                // Slider 1: Start X
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = -12.0f, maxVal = 12.0f;
-                
-                DrawText("Start X:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiCubeStartX - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 0;
-                }
-                if (activeSlider == 0 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiCubeStartX = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.1f", guiCubeStartX), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
+            int y = panelY + 155;
+            DrawText("Depth:", panelX + 5, y, 12, ::DARKGRAY);
+            DrawRectangle(panelX + 70, y, 120, 14, ::DARKGRAY);
+            float norm = (guiDigDepth - 0.02f) / (0.15f - 0.02f);
+            DrawRectangle(panelX + 70 + (int)(norm * 112), y, 8, 14, ::MAROON);
+            Rectangle rect = { (float)(panelX + 70), (float)y, 120.0f, 14.0f };
+            if (CheckCollisionPointRec(mousePos, rect) && mousePressed) activeSlider = 5;
+            if (activeSlider == 5 && mouseDown)
+                guiDigDepth = 0.02f + Clamp((mousePos.x - panelX - 70) / 120.0f, 0.0f, 1.0f) * (0.15f - 0.02f);
+            DrawText(TextFormat("%.0fcm", guiDigDepth * 100), panelX + 195, y, 12, ::BLACK);
             
-            // Slider 2: Start Z
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY + 25;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = -10.0f, maxVal = 10.0f;
-                
-                DrawText("Start Z:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiCubeStartZ - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 1;
-                }
-                if (activeSlider == 1 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiCubeStartZ = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.1f", guiCubeStartZ), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
+            // Damping slider (less rolling)
+            y = panelY + 175;
+            DrawText("Damping:", panelX + 5, y, 12, ::DARKGRAY);
+            DrawRectangle(panelX + 70, y, 120, 14, ::DARKGRAY);
+            float normDamp = (guiParticleDamping - 0.2f) / (1.5f - 0.2f);
+            DrawRectangle(panelX + 70 + (int)(normDamp * 112), y, 8, 14, ::PURPLE);
+            Rectangle rectDamp = { (float)(panelX + 70), (float)y, 120.0f, 14.0f };
+            if (CheckCollisionPointRec(mousePos, rectDamp) && mousePressed) activeSlider = 6;
+            if (activeSlider == 6 && mouseDown)
+                guiParticleDamping = 0.2f + Clamp((mousePos.x - panelX - 70) / 120.0f, 0.0f, 1.0f) * (1.5f - 0.2f);
+            DrawText(TextFormat("%.1f", guiParticleDamping), panelX + 195, y, 12, ::BLACK);
             
-            // Slider 3: Speed
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY + 50;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = 0.5f, maxVal = 10.0f;
-                
-                DrawText("Speed:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiCubeSpeed - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 2;
-                }
-                if (activeSlider == 2 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiCubeSpeed = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.1f", guiCubeSpeed), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
-            
-            // Slider 4: Blade Rotation
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY + 75;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = 0.0f, maxVal = 90.0f;
-                
-                DrawText("Rotation:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiBladeRotation - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 10;
-                }
-                if (activeSlider == 10 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiBladeRotation = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.0f°", guiBladeRotation), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
-            
-            // Slider 5: Height
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY + 100;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = -2.0f, maxVal = 5.0f;
-                
-                DrawText("Height:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiCubeHeight - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::BLUE);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 11;
-                }
-                if (activeSlider == 11 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiCubeHeight = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.1f", guiCubeHeight), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
-            
-            // Slider 6: Engine Power
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY + 125;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = 100.0f, maxVal = 2000.0f;
-                
-                DrawText("Engine:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiEnginePower - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::ORANGE);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 12;
-                }
-                if (activeSlider == 12 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiEnginePower = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.0fN", guiEnginePower), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
-            
-            // Slider 7: Resistance Coefficient
-            {
-                int sliderX = panelX + 70;
-                int sliderY = sliderStartY + 150;
-                int sliderW = 120;
-                int sliderH = 16;
-                float minVal = 10.0f, maxVal = 200.0f;
-                
-                DrawText("Resist:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                
-                float normalized = (guiResistanceCoeff - minVal) / (maxVal - minVal);
-                int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                DrawRectangle(handleX, sliderY, 10, sliderH, ::MAROON);
-                
-                Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                    if (mousePressed) activeSlider = 13;
-                }
-                if (activeSlider == 13 && mouseDown) {
-                    float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                    newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                    guiResistanceCoeff = minVal + newNorm * (maxVal - minVal);
-                }
-                DrawText(TextFormat("%.0f", guiResistanceCoeff), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-            }
-            } else if (driveMode == 1) {
-                // Circle mode sliders
-                // Center X
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = -8.0f, maxVal = 8.0f;
-                    
-                    DrawText("Center X:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiCircleCenterX - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 3;
-                    }
-                    if (activeSlider == 3 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiCircleCenterX = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.1f", guiCircleCenterX), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Center Z
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 25;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = -8.0f, maxVal = 8.0f;
-                    
-                    DrawText("Center Z:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiCircleCenterZ - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 4;
-                    }
-                    if (activeSlider == 4 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiCircleCenterZ = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.1f", guiCircleCenterZ), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Radius
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 50;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = 1.0f, maxVal = 9.0f;
-                    
-                    DrawText("Radius:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiCircleRadius - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 5;
-                    }
-                    if (activeSlider == 5 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiCircleRadius = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.1f", guiCircleRadius), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Speed
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 75;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = 0.5f, maxVal = 10.0f;
-                    
-                    DrawText("Speed:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiCubeSpeed - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 6;
-                    }
-                    if (activeSlider == 6 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiCubeSpeed = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.1f", guiCubeSpeed), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Blade Rotation
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 100;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = 0.0f, maxVal = 90.0f;
-                    
-                    DrawText("Rotation:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiBladeRotation - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 7;
-                    }
-                    if (activeSlider == 7 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiBladeRotation = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.0f°", guiBladeRotation), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Height
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 125;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = -2.0f, maxVal = 5.0f;
-                    
-                    DrawText("Height:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiCubeHeight - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::GREEN);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 8;
-                    }
-                    if (activeSlider == 8 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiCubeHeight = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.1f", guiCubeHeight), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Engine Power (circle mode)
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 150;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = 100.0f, maxVal = 2000.0f;
-                    
-                    DrawText("Engine:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiEnginePower - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::ORANGE);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 14;
-                    }
-                    if (activeSlider == 14 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiEnginePower = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.0fN", guiEnginePower), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-                
-                // Resistance Coefficient (circle mode)
-                {
-                    int sliderX = panelX + 70;
-                    int sliderY = sliderStartY + 175;
-                    int sliderW = 120;
-                    int sliderH = 16;
-                    float minVal = 10.0f, maxVal = 200.0f;
-                    
-                    DrawText("Resist:", panelX + 5, sliderY + 2, 10, ::DARKGRAY);
-                    DrawRectangle(sliderX, sliderY, sliderW, sliderH, ::DARKGRAY);
-                    
-                    float normalized = (guiResistanceCoeff - minVal) / (maxVal - minVal);
-                    int handleX = sliderX + (int)(normalized * (sliderW - 10));
-                    DrawRectangle(handleX, sliderY, 10, sliderH, ::MAROON);
-                    
-                    Rectangle sliderRect = { (float)sliderX, (float)sliderY, (float)sliderW, (float)sliderH };
-                    if (CheckCollisionPointRec(mousePos, sliderRect)) {
-                        if (mousePressed) activeSlider = 15;
-                    }
-                    if (activeSlider == 15 && mouseDown) {
-                        float newNorm = (mousePos.x - sliderX) / (float)sliderW;
-                        newNorm = Clamp(newNorm, 0.0f, 1.0f);
-                        guiResistanceCoeff = minVal + newNorm * (maxVal - minVal);
-                    }
-                    DrawText(TextFormat("%.0f", guiResistanceCoeff), sliderX + sliderW + 5, sliderY + 2, 10, ::BLACK);
-                }
-            } else {
-                // Manual mode - show controls info
-                DrawText("Arrow Keys:", panelX + 5, sliderStartY, 10, ::DARKGRAY);
-                DrawText("UP = Forward", panelX + 10, sliderStartY + 15, 10, ::ORANGE);
-                DrawText("DOWN = Reverse", panelX + 10, sliderStartY + 30, 10, ::ORANGE);
-                DrawText("LEFT = Turn Left", panelX + 10, sliderStartY + 45, 10, ::ORANGE);
-                DrawText("RIGHT = Turn Right", panelX + 10, sliderStartY + 60, 10, ::ORANGE);
-                
-                // Speed display (current)
-                float manualSpeed = sqrtf(manualVelocity.x * manualVelocity.x + manualVelocity.z * manualVelocity.z);
-                DrawText(TextFormat("Speed: %.2f m/s", manualSpeed), panelX + 5, sliderStartY + 80, 10, 
-                         manualSpeed > 0.1f ? ::BLUE : ::GRAY);
-            }
+            DrawText("Initial terrain: 20cm", panelX + 5, panelY + 200, 12, ::GRAY);
             
             if (mouseReleased) activeSlider = -1;
-            
-            // Current position display
-            int footerY = (driveMode == 1) ? panelY + 270 : ((driveMode == 2) ? panelY + 135 : panelY + 210);
-            DrawText(TextFormat("Current: (%.1f, %.1f, %.1f)", cubePosition.x, cubePosition.y, cubePosition.z), 
-                     panelX + 5, footerY, 10, ::BLUE);
-            
-            DrawText("Press G to toggle GUI", panelX + 5, footerY + 20, 10, ::GRAY);
-            DrawText(TextFormat("Press V to toggle voxels %s", showVoxelDebug ? "(ON)" : "(OFF)"), panelX + 5, footerY + 33, 10, 
-                     showVoxelDebug ? ::GREEN : ::GRAY);
-            const char* modeInfo = (driveMode == 0) ? "Linear mode (resets at edge)" : 
-                                   ((driveMode == 1) ? "Circle mode active" : "Manual: Arrows to drive");
-            DrawText(modeInfo, panelX + 5, footerY + 46, 10, ::GRAY);
         }
+        
+        DrawFPS(GetScreenWidth() - 100, GetScreenHeight() - 30);
 
         EndDrawing();
     }
 
-    // Cleanup physics
+    // Cleanup
     for (const auto& sphere : dynamicSpheres) {
         body_interface.RemoveBody(sphere.bodyID);
         body_interface.DestroyBody(sphere.bodyID);
     }
-    body_interface.RemoveBody(cube_body_id);
-    body_interface.DestroyBody(cube_body_id);
+    blade.Cleanup(body_interface);
+    body_interface.RemoveBody(bucket_body_id);
+    body_interface.DestroyBody(bucket_body_id);
     body_interface.RemoveBody(heightmap_body->GetID());
     body_interface.DestroyBody(heightmap_body->GetID());
 
-    // Unload shader and models
     UnloadShader(shader);
     UnloadShader(heightmapShader);
     UnloadTexture(heightmapTexture);
     UnloadModel(sphereModel);
-    UnloadModel(cubeModel);
+    UnloadModel(bucketModel);
     UnloadModel(planeModel);
+    UnloadModel(markerModel);
 
     CloseWindow();
-
     return 0;
 }

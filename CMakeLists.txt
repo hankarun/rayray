@@ -45,7 +45,8 @@ include_directories(include)
 
 # Source files
 set(SOURCES
-    main.cpp
+    #main.cpp
+    main2.cpp
     src/PhysicsLayers.cpp
     src/PhysicsStructures.cpp
     src/DensityAutomata.cpp
@@ -55,6 +56,9 @@ set(SOURCES
     src/MeshCutter.cpp
     src/GeometryBuilder.cpp
     src/JoltPhysicsBackend.cpp
+    src/SceneObject.cpp
+    src/Blade.cpp
+    src/ExcavatorBucket.cpp
 )
 
 # Optional: Enable PhysX backend (uncomment when PhysX is available)
